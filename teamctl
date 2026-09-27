@@ -88,6 +88,15 @@ require_config() {
     https://*) ;;
     *) config_error "TEAMCTL_GIT_API: ungueltig - die API muss mit https:// beginnen" ;;
   esac
+  # Sicherheit: auch die Wiki-URL traegt Zugangsdaten (Session-Cookie/Basic-Auth)
+  # und darf nie ueber Klartext-HTTP gehen - deshalb wie bei TEAMCTL_GIT_API
+  # ausschliesslich "https://" (exakt klein geschrieben, kein
+  # Gross-/Kleinschreibungs-Trick). Die Meldung nennt nur den Schluesselnamen
+  # TEAMCTL_WIKI_URL - nie den Wert/die URL.
+  case "$WIKI_BASE" in
+    https://*) ;;
+    *) config_error "TEAMCTL_WIKI_URL: ungueltig - die URL muss mit https:// beginnen" ;;
+  esac
 }
 
 CURL_OPTS=(-sk --max-time 60)
