@@ -1141,7 +1141,11 @@ git_pulls_all() {
 }
 
 git_cmd() {
-  TOK="$(git_token)"
+  # Fail-fast: schlaegt git_token fehl (z. B. Token-Befehl nicht ausfuehrbar),
+  # darf die Zuweisung den Fehler nicht verschlucken und mit leerem Token
+  # weiterlaufen. git_token meldet den Fehler bereits genau einmal auf stderr;
+  # hier nur der harte Abbruch (kein zusaetzlicher Text, keine Doppelmeldung).
+  TOK="$(git_token)" || exit 1
   local sub; sub="${1:-}"; shift || true
   case "$sub" in
     info) git_info "$@" ;;

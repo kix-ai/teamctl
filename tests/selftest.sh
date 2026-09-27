@@ -184,6 +184,26 @@ case "$out" in
   *) pass "Positiv: erlaubter Befehl akzeptiert und ausgefuehrt" ;;
 esac
 
+# --- 4b) Fail-Fast: fehlschlagender Token-Befehl bricht ab (Issue #15) -------
+# In git_cmd wurde 'TOK="$(git_token)"' ohne '|| exit 1' ausgewertet. Ohne
+# 'set -e' brach der Lesefehler die Funktion nicht ab: TOK blieb leer und der
+# Befehl lief mit leerem Token weiter. Erwartung: Exit 1, GENAU EINE
+# Fehlerzeile (die vorhandene aus git_token) und kein HTTP-Aufruf - der
+# curl-Stub wuerde sonst eine zusaetzliche Meldung/Exit 7 erzeugen.
+out="$(PATH="$BIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_GITHUB_TOKEN_CMD=/nonexistent/nope \
+  bash "$TEAMCTL" git repos 2>&1)"
+rc=$?
+lines="$(printf '%s\n' "$out" | grep -c .)"
+if [ "$rc" -ne 1 ]; then
+  fail "Fail-Fast (Issue #15): Exit != 1 (war $rc)"
+elif [ "$lines" -ne 1 ]; then
+  fail "Fail-Fast (Issue #15): genau 1 Meldung erwartet (waren $lines)"
+elif ! printf '%s' "$out" | grep -q 'TEAMCTL_GITHUB_TOKEN_CMD'; then
+  fail "Fail-Fast (Issue #15): Meldung nennt den Schluesselnamen nicht"
+else
+  pass "Fail-Fast (Issue #15): Token-Lesefehler bricht mit genau 1 Meldung ab (Exit 1)"
+fi
+
 # --- 5) Optional: Live-Positivtest (echte Konfiguration/Token) --------------
 if [ "${TEAMCTL_SELFTEST_LIVE:-0}" = "1" ]; then
   if bash "$TEAMCTL" git repos >/dev/null 2>&1; then
