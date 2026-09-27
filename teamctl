@@ -4,7 +4,19 @@
 # Doku: siehe README.md im selben Verzeichnis.
 set -uo pipefail
 
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Eigenen Pfad robust aufloesen - funktioniert auch, wenn teamctl als
+# Symlink/Wrapper aus einem PATH-Verzeichnis aufgerufen wird.
+_SELF_SRC="${BASH_SOURCE[0]:-$0}"
+while [ -L "$_SELF_SRC" ]; do
+  _SELF_LINK_DIR="$(cd -P "$(dirname "$_SELF_SRC")" && pwd)"
+  _SELF_SRC="$(readlink "$_SELF_SRC")"
+  case "$_SELF_SRC" in
+    /*) ;;
+    *) _SELF_SRC="$_SELF_LINK_DIR/$_SELF_SRC" ;;
+  esac
+done
+SELF_DIR="$(cd -P "$(dirname "$_SELF_SRC")" && pwd)"
+unset _SELF_SRC _SELF_LINK_DIR
 
 # ---------------- Konfiguration ----------------
 # Infrastruktur-Werte (Host, URL, Owner, API) stehen NICHT im Skript, sondern in
@@ -91,6 +103,51 @@ trap cleanup EXIT
 
 mktmp() { local f; f="$(mktemp)"; TMPFILES+=("$f"); printf '%s' "$f"; }
 
+# ---------------- Retry / Backoff (HTTP 429) ----------------
+# Wiederholte Login-/API-Aufrufe am Wiki loesen sporadisch HTTP 429 aus.
+# Wiki-HTTP-Aufrufe werden daher begrenzt wiederholt: exponentielles Backoff
+# mit Zufallsanteil (Jitter), damit sich parallele Agents nicht synchronisieren.
+# Steuerbar per Umgebungsvariable oder teamctl.env:
+#   TEAMCTL_RETRY_MAX   Wiederholungen nach dem ersten Versuch (Default 4)
+#   TEAMCTL_RETRY_BASE  Basis-Sekunden fuer 2^Versuch (Default 2)
+#   TEAMCTL_RETRY_CAP   Obergrenze der Wartezeit je Versuch in s (Default 30)
+TEAMCTL_RETRY_MAX="${TEAMCTL_RETRY_MAX:-4}"
+TEAMCTL_RETRY_BASE="${TEAMCTL_RETRY_BASE:-2}"
+TEAMCTL_RETRY_CAP="${TEAMCTL_RETRY_CAP:-30}"
+
+# retry_delay <versuch> -> Wartezeit in Sekunden (exponentiell + Jitter, >=1)
+retry_delay() {
+  local attempt="$1" d
+  d=$(( TEAMCTL_RETRY_BASE ** attempt ))
+  if [ "$d" -gt "$TEAMCTL_RETRY_CAP" ]; then d="$TEAMCTL_RETRY_CAP"; fi
+  if [ "$d" -lt 1 ]; then d=1; fi
+  printf '%s' "$(( 1 + RANDOM % d ))"
+}
+
+# wiki_http <ausgabedatei> <curl-argumente...>
+# Fuehrt einen Wiki-HTTP-Aufruf aus und wiederholt ihn bei HTTP 429.
+# Gibt den HTTP-Code auf stdout aus; der Body landet in <ausgabedatei>.
+# Ein vorhandener "Retry-After"-Header wird respektiert.
+wiki_http() {
+  local out="$1"; shift
+  local hdr attempt=0 code delay ra
+  hdr="$(mktmp)"
+  while :; do
+    code="$(curl "${CURL_OPTS[@]}" -D "$hdr" -o "$out" -w '%{http_code}' "$@")"
+    if [ "$code" != "429" ]; then printf '%s' "$code"; return 0; fi
+    if [ "$attempt" -ge "$TEAMCTL_RETRY_MAX" ]; then
+      note "Wiki: HTTP 429 (Too Many Requests) - $TEAMCTL_RETRY_MAX Wiederholungen erschoepft, gebe auf"
+      printf '%s' "$code"; return 0
+    fi
+    attempt=$(( attempt + 1 ))
+    delay="$(retry_delay "$attempt")"
+    ra="$(awk 'BEGIN{IGNORECASE=1} /^Retry-After:/{gsub(/[^0-9]/,"",$2); if ($2 != "") {print $2; exit}}' "$hdr" 2>/dev/null)"
+    if [ -n "$ra" ] && [ "$ra" -gt "$delay" ] 2>/dev/null; then delay="$ra"; fi
+    note "Wiki: HTTP 429 (Too Many Requests) - Wiederholung $attempt/$TEAMCTL_RETRY_MAX in ${delay}s"
+    sleep "$delay"
+  done
+}
+
 usage() {
   cat <<'EOF'
 teamctl - gemeinsames CLI fuer Wiki, Blog und Git
@@ -114,6 +171,14 @@ GIT (GitHub, Konto per Token)
   teamctl git list <repo> [dir]
   teamctl git create-repo <name> [--public]
   teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
+  teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
+  teamctl git issue-close <repo> <nummer>
+
+Hinweis:
+  teamctl ist ueber einen Symlink in einem PATH-Verzeichnis (z. B. ~/.local/bin)
+  auch ohne vollen Pfad als "teamctl" aufrufbar. Bei HTTP 429 (Too Many Requests)
+  wiederholt teamctl Wiki-Aufrufe automatisch mit exponentiellem Backoff + Jitter
+  (begrenzt; TEAMCTL_RETRY_MAX/BASE/CAP, Defaults 4/2/30).
 
 Konfiguration: siehe teamctl.env im Skript-Verzeichnis (Vorlage: .env.example).
            TEAMCTL_INFRA_HOST TEAMCTL_WIKI_URL TEAMCTL_WIKI_EMAIL TEAMCTL_BLOG_ROOT
@@ -141,7 +206,7 @@ wiki_login() {
   pw="$(ssh_run "awk -F'|' -v e='$email' '\$3==e{print \$4; exit}' '$WIKI_CREDS' 2>/dev/null")"
   [ -n "$pw" ] || die "Kein Passwort fuer '$email' in $WIKI_CREDS gefunden"
   WIKI_COOKIE="$(mktmp)"
-  code="$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' -X POST \
+  code="$(wiki_http /dev/null -X POST \
     "$WIKI_BASE/api/auth/login" -H 'Content-Type: application/json' \
     --data-binary "$(jq -nc --arg e "$email" --arg p "$pw" '{email:$e,password:$p}')" \
     -c "$WIKI_COOKIE")"
@@ -152,7 +217,7 @@ wiki_api() {
   local ep="$1" body="$2" f
   [ -n "$body" ] || body='{}'
   f="$(mktmp)"
-  WIKI_HTTP="$(curl "${CURL_OPTS[@]}" -o "$f" -w '%{http_code}' -X POST "$WIKI_BASE/api/$ep" \
+  WIKI_HTTP="$(wiki_http "$f" -X POST "$WIKI_BASE/api/$ep" \
     -H 'Content-Type: application/json' -b "$WIKI_COOKIE" --data-binary "$body")"
   WIKI_BODY="$(cat "$f")"
   case "$WIKI_HTTP" in 200|201) return 0 ;; *) return 1 ;; esac
@@ -271,13 +336,13 @@ wiki_upload() {
   [ -f "$file" ] || die "Datei nicht gefunden: $file"
   wiki_login "$WIKI_AS"
   f="$(mktmp)"
-  WIKI_HTTP="$(curl "${CURL_OPTS[@]}" -o "$f" -w '%{http_code}' -X POST "$WIKI_BASE/api/files/upload" \
+  WIKI_HTTP="$(wiki_http "$f" -X POST "$WIKI_BASE/api/files/upload" \
     -b "$WIKI_COOKIE" -F "pageId=$page" -F "file=@$file")"
   WIKI_BODY="$(cat "$f")"
   case "$WIKI_HTTP" in 200|201) ;; *) die "HTTP $WIKI_HTTP bei POST /api/files/upload: $(wiki_err)" ;; esac
   url="$(printf '%s' "$WIKI_BODY" | jq -r '.url // .data.url // empty')"
   [ -n "$url" ] || die "wiki upload: keine URL in der Antwort"
-  code="$(curl "${CURL_OPTS[@]}" -L -o /dev/null -w '%{http_code}' -b "$WIKI_COOKIE" "$url")"
+  code="$(wiki_http /dev/null -L -b "$WIKI_COOKIE" "$url")"
   [ "$code" = "200" ] || die "wiki upload: Read-back fehlgeschlagen (HTTP $code, $url)"
   printf '%s\n' "$url"
 }
@@ -380,6 +445,8 @@ blog_cmd() {
 }
 
 # ---------------- Git (GitHub) ----------------
+GIT_REPO_RE='^[A-Za-z0-9._-]+$'
+
 git_token() {
   local t
   t="$(eval "$GITHUB_TOKEN_CMD" 2>/dev/null)" || die "git: Token nicht lesbar ($GITHUB_TOKEN_CMD)"
@@ -466,6 +533,58 @@ git_upload() {
   printf 'OK\t%s/%s\t%s\t%s\n' "$GITHUB_OWNER" "$repo" "$path" "$rsha"
 }
 
+git_issue() {
+  [ $# -ge 1 ] || die "git issue: <repo> fehlt"
+  local repo="$1"; shift
+  local title="" body="" file="" label="" payload num url state
+  while [ $# -gt 0 ]; do case "$1" in
+    --title) [ $# -ge 2 ] || die "git issue: --title braucht einen Wert"; title="$2"; shift 2 ;;
+    --body)  [ $# -ge 2 ] || die "git issue: --body braucht einen Wert"; body="$2"; shift 2 ;;
+    --file)  [ $# -ge 2 ] || die "git issue: --file braucht einen Wert"; file="$2"; shift 2 ;;
+    --label) [ $# -ge 2 ] || die "git issue: --label braucht einen Wert"; label="$2"; shift 2 ;;
+    *) die "git issue: unbekannte Option '$1'" ;;
+  esac; done
+  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git issue: ungueltiger Repo-Name '$repo'"
+  [ -n "$title" ] || die "git issue: --title fehlt"
+  if [ -n "$file" ] && [ -n "$body" ]; then die "git issue: --body und --file nicht gleichzeitig"; fi
+  if [ -n "$file" ]; then
+    [ -f "$file" ] || die "Datei nicht gefunden: $file"
+    body="$(cat "$file")"
+  fi
+  [ -n "$body" ] || die "git issue: --body oder --file fehlt (Text des Wunsches)"
+  if [ -n "$label" ]; then
+    payload="$(jq -nc --arg t "$title" --arg b "$body" --arg l "$label" '{title:$t, body:$b, labels:($l|split(","))}')"
+  else
+    payload="$(jq -nc --arg t "$title" --arg b "$body" '{title:$t, body:$b}')"
+  fi
+  gh_api POST "/repos/$GITHUB_OWNER/$repo/issues" "$payload" || die "HTTP $GH_HTTP: $(git_err)"
+  note "POST issues: HTTP $GH_HTTP"
+  num="$(printf '%s' "$GH_BODY" | jq -r '.number // empty')"
+  url="$(printf '%s' "$GH_BODY" | jq -r '.html_url // empty')"
+  [ -n "$num" ] || die "git issue: keine Issue-Nummer in der Antwort"
+  gh_api GET "/repos/$GITHUB_OWNER/$repo/issues/$num" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
+  note "GET issue: HTTP $GH_HTTP"
+  state="$(printf '%s' "$GH_BODY" | jq -r '.state // empty')"
+  [ -n "$state" ] || die "git issue: Read-back ohne state"
+  printf 'OK\t%s\t%s\t%s\t%s\n' "$GITHUB_OWNER/$repo" "$num" "$state" "$url"
+}
+
+git_issue_close() {
+  [ $# -ge 2 ] || die "git issue-close: <repo> <nummer> fehlt"
+  local repo="$1" num="$2" payload state url
+  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git issue-close: ungueltiger Repo-Name '$repo'"
+  [[ "$num" =~ ^[0-9]+$ ]] || die "git issue-close: ungueltige Nummer '$num'"
+  payload='{"state":"closed"}'
+  gh_api PATCH "/repos/$GITHUB_OWNER/$repo/issues/$num" "$payload" || die "HTTP $GH_HTTP: $(git_err)"
+  note "PATCH issue: HTTP $GH_HTTP"
+  gh_api GET "/repos/$GITHUB_OWNER/$repo/issues/$num" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
+  note "GET issue: HTTP $GH_HTTP"
+  state="$(printf '%s' "$GH_BODY" | jq -r '.state // empty')"
+  url="$(printf '%s' "$GH_BODY" | jq -r '.html_url // empty')"
+  [ "$state" = "closed" ] || die "git issue-close: Verifikation fehlgeschlagen (state='$state')"
+  printf 'OK\t%s\t%s\t%s\t%s\n' "$GITHUB_OWNER/$repo" "$num" "$state" "$url"
+}
+
 git_cmd() {
   TOK="$(git_token)"
   local sub; sub="${1:-}"; shift || true
@@ -474,8 +593,10 @@ git_cmd() {
     list) git_list "$@" ;;
     create-repo) git_create_repo "$@" ;;
     upload) git_upload "$@" ;;
+    issue) git_issue "$@" ;;
+    issue-close) git_issue_close "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "git: unbekannter Unterbefehl (info|list|create-repo|upload)" ;;
+    *) die "git: unbekannter Unterbefehl (info|list|create-repo|upload|issue|issue-close)" ;;
   esac
 }
 
