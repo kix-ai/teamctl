@@ -55,9 +55,11 @@ GIT (GitHub, Konto per Token)
     teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
     teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
     teamctl git issue-close <repo> <nummer>
+    teamctl git issues <repo> [--state open|closed|all] [--label <l>]
 
 `git issue` legt Issues (z. B. Feature-Requests/Wuensche) an; `--label` akzeptiert
 Labels, mehrere kommagetrennt. `git issue-close` schliesst ein Issue wieder
+(`state=closed`). `git issues` listet Issues (Standard `--state open`) TAB-getrennt.
 (`state=closed`). Beide lesen Owner/API/Token aus der Konfiguration (keine Werte hier).
 
 ## Konfiguration
