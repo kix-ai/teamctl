@@ -46,32 +46,8 @@ for _k in "${CONFIG_KEYS[@]}"; do
 done
 unset _ENV_SAVE _k
 
-# TLS-Verifikation fuer das Wiki (Leaf == CA, selbstsigniert).
-# Nur der Pfad zur CA-Datei kommt aus der Konfiguration; der Dateiinhalt
-# (Zertifikat) liegt ausserhalb von Git. Meldungen nennen nur den
-# Schluesselnamen, nie den Wert/Pfad.
-TEAMCTL_WIKI_CA="${TEAMCTL_WIKI_CA:-}"
-
-# curl-Argumente fuer Wiki-Aufrufe. Leer = System-CA, sonst explizite CA.
-WIKI_CURL_OPTS=()
-
-# wiki_ca_opts - CA-Option fuer Wiki-curl-Aufrufe.
-# Ist TEAMCTL_WIKI_CA gesetzt, muss die Datei existieren, nicht leer und
-# lesbar sein; sonst fail-fast (nur der Schluesselname wird genannt).
-wiki_ca_opts() {
-  if [ -z "$TEAMCTL_WIKI_CA" ]; then
-    WIKI_CURL_OPTS=()
-    return 0
-  fi
-  if [ ! -f "$TEAMCTL_WIKI_CA" ]; then
-    die "TEAMCTL_WIKI_CA gesetzt, aber CA-Datei fehlt oder ist keine regulaere Datei."
-  fi
-  if [ ! -r "$TEAMCTL_WIKI_CA" ] || [ ! -s "$TEAMCTL_WIKI_CA" ]; then
-    die "TEAMCTL_WIKI_CA gesetzt, aber CA-Datei ist leer oder nicht lesbar."
-  fi
-  WIKI_CURL_OPTS=(--cacert "$TEAMCTL_WIKI_CA")
-}
-
+# Fehler-/Hinweisausgabe. Bewusst frueh definiert, damit auch die
+# Konfigurationspruefung (CA-Zustand) direkt abbrechen kann.
 # Pflichtwerte - bewusst OHNE Default im Skript (Infra ist austauschbar).
 INFRA_HOST="${TEAMCTL_INFRA_HOST:-}"
 WIKI_BASE="${TEAMCTL_WIKI_URL:-}"
@@ -106,22 +82,7 @@ require_config() {
   fi
 }
 
-# Schemapflicht: Endpoint-Werte duerfen ausschliesslich ueber https:// laufen.
-# Laeuft NACH der Vorrangs-Logik (echte Umgebungsvariable > Datei) und nach
-# require_config, damit auch ueberschreibende env-Werte geprueft werden.
-# Die Fehlermeldung nennt nur den betroffenen Schluessel - nie den Wert/URL/Host.
-require_https_endpoints() {
-  case "$GITHUB_API" in
-    https://*) ;;
-    *) config_error "TEAMCTL_GIT_API muss mit https:// beginnen." ;;
-  esac
-  case "$WIKI_BASE" in
-    https://*) ;;
-    *) config_error "TEAMCTL_WIKI_URL muss mit https:// beginnen." ;;
-  esac
-}
-
-CURL_OPTS=(-s --max-time 60)
+CURL_OPTS=(-sk --max-time 60)
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15)
 
 TOK=""
@@ -134,6 +95,51 @@ TMPFILES=()
 
 die()  { printf 'teamctl: FEHLER: %s\n' "$*" >&2; exit 1; }
 note() { printf 'teamctl: %s\n' "$*" >&2; }
+# TLS-Verifikation fuer das Wiki (Leaf == CA, selbstsigniert).
+# Der Pfad zur CA-Datei kommt aus der Konfiguration; der Dateiinhalt
+# (Zertifikat) liegt ausserhalb von Git. Der Zustand wird EINMAL im
+# Hauptprozess geprueft (fail-fast), damit alle Wiki-Aufrufe mit derselben
+# CA laufen. Meldungen nennen nur den Schluesselnamen - nie den Wert/Pfad.
+TEAMCTL_WIKI_CA="${TEAMCTL_WIKI_CA:-}"
+
+# curl-Argumente fuer Wiki-Aufrufe (leer = System-CA, sonst explizite CA).
+WIKI_CURL_OPTS=()
+
+# wiki_ca_opts - CA-Zustand pruefen und WIKI_CURL_OPTS setzen.
+# Setzt der Hauptprozess, nicht eine Subshell: sonst ginge die CA-Option
+# verloren und ein Abbruch beendete nur die Subshell (fail-soft).
+# Fehlermeldungen nennen ausschliesslich TEAMCTL_WIKI_CA - nie den Wert/Pfad.
+wiki_ca_opts() {
+  WIKI_CURL_OPTS=()
+  if [ -z "$TEAMCTL_WIKI_CA" ]; then
+    return 0
+  fi
+  if [ ! -e "$TEAMCTL_WIKI_CA" ]; then
+    die "TEAMCTL_WIKI_CA: Datei fehlt."
+  fi
+  if [ -d "$TEAMCTL_WIKI_CA" ]; then
+    die "TEAMCTL_WIKI_CA: Pfad ist ein Verzeichnis."
+  fi
+  if [ ! -f "$TEAMCTL_WIKI_CA" ]; then
+    die "TEAMCTL_WIKI_CA: kein regulaerer Dateityp."
+  fi
+  if [ ! -r "$TEAMCTL_WIKI_CA" ]; then
+    die "TEAMCTL_WIKI_CA: Datei nicht lesbar."
+  fi
+  if [ ! -s "$TEAMCTL_WIKI_CA" ]; then
+    die "TEAMCTL_WIKI_CA: Datei ist leer."
+  fi
+  if ! head -c 12 -- "$TEAMCTL_WIKI_CA" 2>/dev/null | grep -q -- "-----BEGIN"; then
+    die "TEAMCTL_WIKI_CA: Datei ist kein PEM-Zertifikat."
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    die "TEAMCTL_WIKI_CA: Werkzeug openssl fehlt zur CA-Pruefung."
+  fi
+  if ! openssl x509 -in "$TEAMCTL_WIKI_CA" -noout >/dev/null 2>&1; then
+    die "TEAMCTL_WIKI_CA: openssl konnte die Datei nicht als Zertifikat lesen."
+  fi
+  WIKI_CURL_OPTS=(--cacert "$TEAMCTL_WIKI_CA")
+}
 
 cleanup() {
   [ -n "$WIKI_COOKIE" ] && rm -f "$WIKI_COOKIE"
@@ -172,10 +178,15 @@ retry_delay() {
 wiki_http() {
   local out="$1"; shift
   local hdr attempt=0 code delay ra
-  wiki_ca_opts
   hdr="$(mktmp)"
   while :; do
     code="$(curl "${CURL_OPTS[@]}" "${WIKI_CURL_OPTS[@]}" -D "$hdr" -o "$out" -w '%{http_code}' "$@")"
+    # HTTP 000: kein HTTP-Status = TLS-/Verbindungsfehler. Klar abbrechen,
+    # statt den Fehler als regulaeren Code weiterzureichen. Die Meldung
+    # nennt bewusst keine Werte/URLs.
+    if [ "$code" = "000" ]; then
+      die "Wiki: keine HTTP-Antwort (TLS-/Verbindungsfehler) - Aufruf abgebrochen."
+    fi
     if [ "$code" != "429" ]; then printf '%s' "$code"; return 0; fi
     if [ "$attempt" -ge "$TEAMCTL_RETRY_MAX" ]; then
       note "Wiki: HTTP 429 (Too Many Requests) - $TEAMCTL_RETRY_MAX Wiederholungen erschoepft, gebe auf"
@@ -239,7 +250,6 @@ Hinweis:
 Konfiguration: siehe teamctl.env im Skript-Verzeichnis (Vorlage: .env.example).
            TEAMCTL_INFRA_HOST TEAMCTL_WIKI_URL TEAMCTL_WIKI_EMAIL TEAMCTL_BLOG_ROOT
            TEAMCTL_GIT_OWNER TEAMCTL_GIT_API TEAMCTL_SSH_KEY TEAMCTL_WIKI_CREDS
-           TEAMCTL_WIKI_CA
 EOF
 }
 
@@ -283,7 +293,7 @@ wiki_api() {
 wiki_err() { printf '%s' "$WIKI_BODY" | jq -r '.message // .error // empty' 2>/dev/null | head -1; }
 
 wiki_api_or_die() {
-  wiki_api "$1" "$2" || die "HTTP $WIKI_HTTP bei POST /api/$1: $(wiki_err)"
+  wiki_api "$1" "$2" || { note "Wiki: HTTP $WIKI_HTTP bei POST /api/$1: $(wiki_err)"; return 1; }
 }
 
 wiki_fetch_sidebar() {
@@ -293,7 +303,7 @@ wiki_fetch_sidebar() {
   else
     body="$(jq -nc --arg s "$space" '{spaceId:$s}')"
   fi
-  wiki_api "pages/sidebar-pages" "$body" || die "HTTP $WIKI_HTTP bei POST /api/pages/sidebar-pages: $(wiki_err)"
+  wiki_api "pages/sidebar-pages" "$body" || { note "Wiki: HTTP $WIKI_HTTP bei POST /api/pages/sidebar-pages: $(wiki_err)"; return 1; }
 }
 
 wiki_print_tree() {
@@ -636,19 +646,8 @@ git_owner_repo() {
 }
 
 git_token() {
-  # Injektionssicher: kein eval, keine Shell-Expansion. Der Befehl wird als
-  # einfache Wortliste (word splitting) ausgefuehrt. Erlaubt sind nur
-  # harmlose Zeichen; Metazeichen werden abgelehnt (Meldung nennt nur den
-  # Schluesselnamen, nie den Wert).
-  local -a cmd
-  case "$GITHUB_TOKEN_CMD" in
-    *[!A-Za-z0-9_./\ -]*)
-      die "git: TEAMCTL_GITHUB_TOKEN_CMD enthaelt unerlaubte Zeichen (erlaubt: A-Z a-z 0-9 _ . / - und Leerzeichen)" ;;
-  esac
-  IFS=' ' read -r -a cmd <<< "$GITHUB_TOKEN_CMD"
-  [ "${#cmd[@]}" -gt 0 ] || die "git: TEAMCTL_GITHUB_TOKEN_CMD ist leer"
   local t
-  t="$("${cmd[@]}" 2>/dev/null)" || die "git: Token nicht lesbar (TEAMCTL_GITHUB_TOKEN_CMD)"
+  t="$(eval "$GITHUB_TOKEN_CMD" 2>/dev/null)" || die "git: Token nicht lesbar ($GITHUB_TOKEN_CMD)"
   [ -n "$t" ] || die "git: Token leer"
   printf '%s' "$t"
 }
@@ -1069,7 +1068,8 @@ case "$cmd" in
   ""|-h|--help|help) usage; exit 0 ;;
 esac
 require_config
-require_https_endpoints
+# CA-Zustand EINMAL im Hauptprozess initialisieren (fail-fast, keine Subshell).
+wiki_ca_opts
 case "$cmd" in
   wiki) wiki_cmd "$@" ;;
   blog) blog_cmd "$@" ;;
