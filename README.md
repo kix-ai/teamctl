@@ -75,6 +75,7 @@ betroffenen Schluessel nennt - nie den Wert, Host oder die URL.
 | `TEAMCTL_RETRY_MAX` | `4` | Wiederholungen bei HTTP 429 |
 | `TEAMCTL_RETRY_BASE` | `2` | Basis-Sekunden fuer das Backoff |
 | `TEAMCTL_RETRY_CAP` | `30` | Obergrenze der Wartezeit je Versuch (Sekunden) |
+| `TEAMCTL_WIKI_CA` | (kein) | Pfad zum CA-/Leaf-Zertifikat (PEM) des Wiki-Hosts; gesetzt => Wiki-curl-Aufrufe nutzen `--cacert` und verifizieren das Zertifikat |
 
 ## Beispiele
 
@@ -138,6 +139,13 @@ die jeweiligen Unterbefehle.
   Leerzeichen. Alle anderen Zeichen (u. a. `; & | > < $ ( )`, Backticks und
   Zeilenumbrueche) werden abgelehnt. Die Fehlermeldung nennt nur den
   Schluesselnamen, nie den Befehl oder den Token.
+- `TEAMCTL_WIKI_CA` nennt nur den Pfad zu einer CA-/Leaf-Zertifikatsdatei
+  (PEM) ausserhalb von Git. Ist der Schluessel gesetzt, verifizieren alle
+  Wiki-curl-Aufrufe das Serverzertifikat ueber `--cacert` (kein `-k`/Bypass).
+  Fehlt die Datei, ist sie leer oder nicht lesbar, bricht `teamctl` ab; die
+  Meldung nennt nur den Schluesselnamen, nie den Pfad oder Zertifikatsinhalt.
+- Ohne `TEAMCTL_WIKI_CA` nutzen Wiki-Aufrufe die System-CA. Fuer ein
+  selbstsigniertes Wiki muss der Schluessel gesetzt sein.
 
 ## Lizenz
 
