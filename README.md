@@ -109,12 +109,32 @@ GIT (GitHub, Konto per Token)
     teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
     teamctl git pull <dir>
     teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
+                      [--author <agent-id>] [--require-author]
     teamctl git issue-close <repo> <nummer>
     teamctl git issues <repo> [--state open|closed|all] [--label <l>]
     teamctl git issues-all [--state open|closed|all] [--label <l>]
 
 `teamctl help` zeigt die Kurzuebersicht, `teamctl wiki|blog|git --help`
 die jeweiligen Unterbefehle.
+
+### Ersteller-Kennung bei `git issue`
+
+Konvention (Quelle: Wiki "Team & Koordination" -> "Richtlinien & Vorgaben"):
+ein Issue traegt im Titel das Praefix `[<agent-id>]` und beginnt im Body mit
+`Ersteller: <agent-id>` sowie `Datum: <YYYY-MM-DD>`.
+
+- `teamctl git issue` prueft die Kennung und warnt bei fehlender/unvollstaendiger
+  Kennung auf **stderr** - das Issue wird trotzdem angelegt, der Exit-Code bleibt 0.
+- `--require-author` macht die Pruefung strikt: fehlt die Kennung, bricht
+  `teamctl` mit Klartext auf stderr und Exit-Code ungleich 0 ab - **bevor** ein
+  Issue angelegt wird (kein API-Schreibaufruf).
+- `--author <agent-id>` setzt die Kennung automatisch: Titel-Praefix
+  `[<agent-id>] ` (falls der Titel noch nicht mit `[` beginnt) und Body-Beginn
+  `Ersteller: <agent-id>` + `Datum: <YYYY-MM-DD>` (falls der Body nicht schon
+  mit `Ersteller:` beginnt).
+
+Ohne die neuen Flags bleiben Titel und Body unveraendert; die Pruefung aendert die
+stdout-Ausgabe nicht (Hinweise gehen ausschliesslich auf stderr).
 
 ## Ausgabe und Fehler
 
