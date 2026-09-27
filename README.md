@@ -51,6 +51,7 @@ BLOG (statische Seite auf dem Infra-Host)
 
 GIT (GitHub, Konto per Token)
     teamctl git info <repo>
+    teamctl git repos                              # alle Repos des Kontos (TAB)
     teamctl git list <repo> [dir]
     teamctl git create-repo <name> [--public]     # Standard: privat
     teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
@@ -68,6 +69,8 @@ Labels, mehrere kommagetrennt. `git issue-close` schliesst ein Issue wieder
 (`state=closed`). Beide lesen Owner/API/Token aus der Konfiguration (keine Werte hier).
 `git issues-all` listet Issues ueber ALLE sichtbaren Repos in einem Aufruf
 (Standard `--state open`); Pull Requests werden uebersprungen.
+`git repos` listet alle Repositories des Kontos TAB-getrennt (Name, Sichtbarkeit,
+Default-Branch, pushed_at, html_url), sortiert nach Name. Read-only.
 
 `git read` (Alias `git cat`) gibt den Inhalt einer Datei ueber die
 GitHub-Contents-API aus; `--ref <branch>` waehlt eine andere Revision.
