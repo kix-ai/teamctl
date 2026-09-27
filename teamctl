@@ -171,6 +171,7 @@ BLOG (statische Seite auf dem Infra-Host)
 
 GIT (GitHub, Konto per Token)
   teamctl git info <repo>
+  teamctl git branches <repo>
   teamctl git repos
   teamctl git list <repo> [dir]
   teamctl git create-repo <name> [--public]
@@ -570,6 +571,18 @@ git_info() {
   printf '%s' "$GH_BODY" | jq -r '"full_name\t\(.full_name)", "private\t\(.private)", "default_branch\t\(.default_branch)", "description\t\(.description // "")", "html_url\t\(.html_url)", "size_kb\t\(.size)"'
 }
 
+# git_branches <repo>
+# Listet die Branches eines Repos (read-only) TAB-getrennt:
+#   name<TAB>sha(kurz, 7 Zeichen)<TAB>protected(true|false)
+# Sortiert nach name (jq sort_by(.name)).
+git_branches() {
+  [ $# -ge 1 ] || die "git branches: <repo> fehlt"
+  local repo="$1"
+  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git branches: ungueltiger Repo-Name '$repo'"
+  gh_api GET "/repos/$GITHUB_OWNER/$repo/branches?per_page=100" "" || die "HTTP $GH_HTTP: $(git_err)"
+  printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (sort_by(.name)[] | [.name, (.commit.sha[0:7]), ((.protected // false)|tostring)] | @tsv) else ((.message // "Fehler")|tostring) end'
+}
+
 git_list() {
   [ $# -ge 1 ] || die "git list: <repo> fehlt"
   local repo="$1" dir="" path
@@ -833,6 +846,7 @@ git_cmd() {
   local sub; sub="${1:-}"; shift || true
   case "$sub" in
     info) git_info "$@" ;;
+    branches) git_branches "$@" ;;
     repos) git_repos "$@" ;;
     list) git_list "$@" ;;
     create-repo) git_create_repo "$@" ;;
@@ -846,7 +860,7 @@ git_cmd() {
     issues) git_issues "$@" ;;
     issues-all) git_issues_all "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "git: unbekannter Unterbefehl (info|repos|list|create-repo|upload|read|cat|clone|pull|issue|issue-close|issues|issues-all)" ;;
+    *) die "git: unbekannter Unterbefehl (info|branches|repos|list|create-repo|upload|read|cat|clone|pull|issue|issue-close|issues|issues-all)" ;;
   esac
 }
 
