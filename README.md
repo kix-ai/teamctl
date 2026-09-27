@@ -1,40 +1,80 @@
-# teamctl (lokale Installation)
+# teamctl
 
-Gemeinsames internes CLI fuer **Wiki (Docmost)**, **Blog (statische Seite)** und
-**Git (GitHub)**. Kurze Befehle, damit Agents Token sparen. Es gibt keine Secrets aus.
+Schlankes Kommandozeilen-Werkzeug (Bash), mit dem ein Team seine Infrastruktur
+mit kurzen Befehlen verwaltet:
 
-## Ablage (dieser Host)
+- **Wiki (Docmost)** - Spaces und Seiten lesen, suchen, anlegen, aktualisieren
+- **Blog (statische Seite)** - Posts veroeffentlichen und in die Indexseite einhaengen
+- **Git (GitHub)** - Repos, Branches, Commits, Issues, Dateien lesen und schreiben
 
-- Skript:        `<install-dir>/teamctl` (ausfuehrbar)
-- Konfiguration: `<install-dir>/teamctl.env` (chmod 600,
-                 NICHT in Git und NICHT in der Wiki-Doku)
-- Vorlage:       `<install-dir>/.env.example`
-                 (nur Schluessel/Platzhalter, keine Werte)
-- SSH-Key (600): `<install-dir>/.ssh/id_ed25519`
-- Hilfe:         `teamctl help` (oder `teamctl wiki|blog|git --help`)
-- PATH-Aufruf:   `teamctl ...` ohne vollen Pfad via Symlink in einem
-                 PATH-Verzeichnis (z. B. `~/.local/bin/teamctl`, s. u.)
+Die Ausgabe ist knapp und maschinenlesbar (TAB-getrennt); Statuszeilen gehen auf
+stderr. Zugangsdaten stehen ausschliesslich in der lokalen Konfigurationsdatei
+`teamctl.env` (chmod 600) und werden nie ausgegeben.
 
-## Aufruf ohne vollen Pfad (PATH)
+## Voraussetzungen
 
-`teamctl` ist zusaetzlich als **Symlink in einem PATH-Verzeichnis** hinterlegt,
-damit kurze Aufrufe wie `teamctl wiki spaces` ohne vollen Pfad funktionieren:
+- Bash, `curl`, `jq`, `git`, `ssh`/`scp`
+- GitHub-Zugriff ueber einen Token (siehe Konfiguration)
+- fuer den Wiki-Teil: erreichbare Docmost-Instanz
+- fuer den Blog-Teil: SSH-Zugang zu dem Host, auf dem die statische Seite liegt
 
-- kanonisch:   `~/.local/bin/teamctl`  (hier: `~/.local/bin/teamctl`)
-- zusaetzlich: `~/bin/teamctl`         (Fallback fuer Setups mit `~/bin` im PATH)
+## Installation
 
-Der Symlink zeigt auf `<install-dir>/teamctl`. Das Skript
-loest seinen eigenen Pfad auch ueber Symlinks hinweg auf und findet seine
-`teamctl.env` daher weiterhin im Verzeichnis des echten Skripts.
+1. Repo klonen (oder Dateien ablegen) und ausfuehrbar machen:
 
-Hinweis (nicht-interaktive Shells, z. B. `bash -c` oder Cron): dort gilt der PATH
-der aufrufenden Umgebung. Ist `~/.local/bin` nicht enthalten, entweder den PATH
-ergaenzen (`export PATH="$HOME/.local/bin:$PATH"`) oder als robuste Rueckfall-
-loesung den vollen Pfad `<install-dir>/teamctl` nutzen.
+       git clone https://github.com/kix-ai/teamctl.git
+       cd teamctl
+       chmod +x teamctl
 
-## Nutzung
+2. Konfiguration anlegen (Vorlage kopieren und Werte eintragen):
+
+       cp .env.example teamctl.env
+       chmod 600 teamctl.env
+
+   `teamctl.env` ist vertraulich und wird nie committet (siehe `.gitignore`).
+
+3. Optional ohne vollen Pfad aufrufbar machen (Symlink in einem PATH-Verzeichnis):
+
+       mkdir -p ~/.local/bin
+       ln -sf "$PWD/teamctl" ~/.local/bin/teamctl
+
+   Das Skript loest seinen eigenen Pfad auch ueber Symlinks auf und findet seine
+   `teamctl.env` daher weiterhin im Verzeichnis des echten Skripts.
+
+## Konfiguration
+
+Alle Infrastruktur-Werte kommen aus `teamctl.env` (oder aus echten
+Umgebungsvariablen, die Vorrang haben). Der Pfad ist per `TEAMCTL_ENV_FILE`
+aenderbar. Fehlt ein Pflichtwert, bricht `teamctl` mit einer klaren Fehlermeldung
+und Verweis auf die Konfigurationsdatei ab.
+
+### Pflichtwerte
+
+| Variable | Bedeutung |
+| --- | --- |
+| `TEAMCTL_INFRA_HOST` | SSH-Ziel fuer Blog/SSH-Funktionen, Form `user@host` |
+| `TEAMCTL_WIKI_URL` | Basis-URL der Docmost-Instanz |
+| `TEAMCTL_WIKI_EMAIL` | Login-E-Mail des Wiki-Kontos |
+| `TEAMCTL_BLOG_ROOT` | Verzeichnis der statischen Seite auf dem Host |
+| `TEAMCTL_GIT_OWNER` | GitHub-Account/Organisation der Repos |
+| `TEAMCTL_GIT_API` | GitHub-API-Basis, ueblich: https://api.github.com |
+
+### Optionale Werte
+
+| Variable | Default | Bedeutung |
+| --- | --- | --- |
+| `TEAMCTL_SSH_KEY` | `~/.ssh/id_ed25519` | Pfad zum privaten SSH-Key |
+| `TEAMCTL_WIKI_CREDS` | `<skriptverzeichnis>/wiki-credentials.txt` | Kontendatei auf dem Host (pipe-getrennt; `#` am Zeilenanfang = Kommentar) |
+| `TEAMCTL_WIKI_AS` | `TEAMCTL_WIKI_EMAIL` | Wiki-Konto fuer Logins |
+| `TEAMCTL_GITHUB_TOKEN_CMD` | `gh auth token` | Befehl, der den GitHub-Token auf stdout liefert |
+| `TEAMCTL_RETRY_MAX` | `4` | Wiederholungen bei HTTP 429 |
+| `TEAMCTL_RETRY_BASE` | `2` | Basis-Sekunden fuer das Backoff |
+| `TEAMCTL_RETRY_CAP` | `30` | Obergrenze der Wartezeit je Versuch (Sekunden) |
+
+## Beispiele
 
 WIKI (Docmost)
+
     teamctl wiki spaces
     teamctl wiki pages <spaceId>
     teamctl wiki get <pageId>
@@ -44,20 +84,22 @@ WIKI (Docmost)
     teamctl wiki upload <pageId> <bilddatei>
     (optional ueberall: --as <email|name>)
 
-BLOG (statische Seite auf dem Infra-Host)
+BLOG (statische Seite auf dem Host)
+
     teamctl blog list
     teamctl blog publish --file <html> --slug <slug>
     teamctl blog link --title <T> --slug <slug>
 
 GIT (GitHub, Konto per Token)
+
     teamctl git info <repo>
-    teamctl git branches <repo>                    # Branches: name, sha(kurz), protected (TAB, sortiert)
-    teamctl git commits <repo> [--n <anzahl>]      # letzte Commits: sha(kurz), ISO-Datum, Author, Betreff (TAB)
-    teamctl git repos                              # alle Repos des Kontos (TAB)
+    teamctl git branches <repo>
+    teamctl git commits <repo> [--n <anzahl>]
+    teamctl git repos
     teamctl git list <repo> [dir]
-    teamctl git create-repo <name> [--public]     # Standard: privat
+    teamctl git create-repo <name> [--public]
     teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
-    teamctl git read <repo> <pfad> [--ref <branch>]      # Alias: git cat
+    teamctl git read <repo> <pfad> [--ref <branch>]      (Alias: git cat)
     teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
     teamctl git pull <dir>
     teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
@@ -65,65 +107,26 @@ GIT (GitHub, Konto per Token)
     teamctl git issues <repo> [--state open|closed|all] [--label <l>]
     teamctl git issues-all [--state open|closed|all] [--label <l>]
 
-`git issue` legt Issues (z. B. Feature-Requests/Wuensche) an; `--label` akzeptiert
-Labels, mehrere kommagetrennt. `git issue-close` schliesst ein Issue wieder
-(`state=closed`). `git issues` listet Issues (Standard `--state open`) TAB-getrennt.
-(`state=closed`). Beide lesen Owner/API/Token aus der Konfiguration (keine Werte hier).
-`git issues-all` listet Issues ueber ALLE sichtbaren Repos in einem Aufruf
-(Standard `--state open`); Pull Requests werden uebersprungen.
-`git repos` listet alle Repositories des Kontos TAB-getrennt (Name, Sichtbarkeit,
-Default-Branch, pushed_at, html_url), sortiert nach Name. Read-only.
+`teamctl help` zeigt die Kurzuebersicht, `teamctl wiki|blog|git --help`
+die jeweiligen Unterbefehle.
 
-`git commits <repo> [--n <anzahl>]` listet die letzten Commits eines Repos
-(read-only) TAB-getrennt, eine Zeile je Commit:
-`sha(kurz, 7)<TAB>ISO-Datum<TAB>author-login<TAB>erste Zeile der Nachricht`.
-`--n` ist die Anzahl (Default 10, erlaubt 1..100). Beispiel:
-`teamctl git commits teamctl --n 3`. Alle `git`-Unterbefehle pruefen den
-Repo-Namen (erlaubte Zeichen, keine `.`/`..`).
+## Ausgabe und Fehler
 
-`git read` (Alias `git cat`) gibt den Inhalt einer Datei ueber die
-GitHub-Contents-API aus; `--ref <branch>` waehlt eine andere Revision.
-`git clone <repo> [--dir <ziel>] [--branch <b>]` klont ein Team-Repo per HTTPS
-(Standardziel: Repo-Name im aktuellen Verzeichnis) und `git pull <dir>`
-aktualisiert es (nur Fast-Forward). Das Token wird ausschliesslich intern als
-HTTP-Header uebergeben - nie in URL, Kommandozeile oder Ausgabe - und NICHT im
-geklonten Repo gespeichert; Updates laufen daher wieder ueber `teamctl git pull`.
-
-## Konfiguration
-
-Infrastruktur-Werte (Host, URL, Owner, API) stehen NICHT im Skript und NICHT in
-dieser Doku, sondern ausschliesslich in der vertraulichen Datei `teamctl.env`
-(chmod 600, nicht in Git). teamctl laedt die Datei automatisch; der Pfad ist per
-`TEAMCTL_ENV_FILE` aenderbar. Echte Umgebungsvariablen haben Vorrang vor der Datei.
-
-Werte-Vorlage: `.env.example` im selben Verzeichnis (nur Schluessel und
-Platzhalter - zum Befuellen von `teamctl.env` kopieren).
-
-Pflichtwerte: TEAMCTL_INFRA_HOST, TEAMCTL_WIKI_URL, TEAMCTL_WIKI_EMAIL,
-TEAMCTL_BLOG_ROOT, TEAMCTL_GIT_OWNER, TEAMCTL_GIT_API.
-Optional: TEAMCTL_SSH_KEY, TEAMCTL_WIKI_CREDS, TEAMCTL_WIKI_AS,
-TEAMCTL_GITHUB_TOKEN_CMD, TEAMCTL_RETRY_MAX, TEAMCTL_RETRY_BASE, TEAMCTL_RETRY_CAP.
-
-Fehlt Konfiguration, bricht teamctl mit einer klaren Fehlermeldung und Verweis
-auf die Konfigurationsdatei ab.
-
-## Ausgabe / Fehler
-
-- Ausgabe ist knapp und maschinenlesbar (TAB-getrennt).
-- Hinweis-/Statuszeilen gehen auf stderr, Daten auf stdout.
-- Bei Fehler: Klartext + HTTP-Code, Exit-Code != 0.
-- Bei HTTP 429 (Too Many Requests) wiederholt teamctl Wiki-Aufrufe automatisch:
-  begrenzte Anzahl Versuche, exponentielles Backoff mit Zufallsanteil (Jitter),
-  `Retry-After`-Header wird beachtet; jede Wiederholung wird auf stderr gemeldet.
-  Steuerung: `TEAMCTL_RETRY_MAX` (Default 4), `TEAMCTL_RETRY_BASE` (Default 2),
-  `TEAMCTL_RETRY_CAP` (Default 30). Nach erschoepften Versuchen klarer Abbruch.
-- Alle Schreibbefehle machen einen Read-back (Verifikation) und schlagen
-  fehl, wenn das Ergebnis nicht bestaetigt werden kann.
+- Daten auf stdout, Hinweis-/Statuszeilen auf stderr, TAB-getrennt.
+- Bei Fehlern Klartext, HTTP-Code und Exit-Code ungleich 0.
+- Bei HTTP 429 wiederholt `teamctl` Wiki-Aufrufe automatisch (begrenztes
+  Backoff mit Jitter, `Retry-After` wird beachtet).
+- Alle Schreibbefehle machen einen Read-back und schlagen fehl, wenn das Ergebnis
+  nicht bestaetigt werden kann.
 
 ## Sicherheit
 
-- Passwoerter werden nur auf dem Host aus der Credential-Datei gelesen
-  und nie ausgegeben oder in Dateien geschrieben.
-- Git-/SSH-Token werden nur zur Laufzeit in Variablen gehalten.
-- `teamctl.env` ist vertraulich: chmod 600 und nicht im Git-Repository.
-- Slugs werden auf [A-Za-z0-9._-] beschraenkt (keine Pfad-Traversal).
+- Zugangsdaten und Tokens werden nur zur Laufzeit gelesen und nie ausgegeben.
+- `teamctl.env` bleibt lokal (chmod 600, per `.gitignore` ausgeschlossen).
+- Git- und SSH-Token werden nur intern als HTTP-Header uebergeben - nie in URL,
+  Kommandozeile oder Ausgabe - und nicht im geklonten Repo gespeichert.
+- Slugs werden auf `[A-Za-z0-9._-]` beschraenkt (kein Pfad-Traversal).
+
+## Lizenz
+
+MIT - siehe `LICENSE`.
