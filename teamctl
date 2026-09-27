@@ -80,6 +80,21 @@ require_config() {
   fi
 }
 
+# Schemapflicht: Endpoint-Werte duerfen ausschliesslich ueber https:// laufen.
+# Laeuft NACH der Vorrangs-Logik (echte Umgebungsvariable > Datei) und nach
+# require_config, damit auch ueberschreibende env-Werte geprueft werden.
+# Die Fehlermeldung nennt nur den betroffenen Schluessel - nie den Wert/URL/Host.
+require_https_endpoints() {
+  case "$GITHUB_API" in
+    https://*) ;;
+    *) config_error "TEAMCTL_GIT_API muss mit https:// beginnen." ;;
+  esac
+  case "$WIKI_BASE" in
+    https://*) ;;
+    *) config_error "TEAMCTL_WIKI_URL muss mit https:// beginnen." ;;
+  esac
+}
+
 CURL_OPTS=(-sk --max-time 60)
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15)
 
@@ -1015,6 +1030,7 @@ case "$cmd" in
   ""|-h|--help|help) usage; exit 0 ;;
 esac
 require_config
+require_https_endpoints
 case "$cmd" in
   wiki) wiki_cmd "$@" ;;
   blog) blog_cmd "$@" ;;
