@@ -176,6 +176,7 @@ GIT (GitHub, Konto per Token)
   teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
   teamctl git issue-close <repo> <nummer>
   teamctl git issues <repo> [--state open|closed|all] [--label <l>]
+  teamctl git issues-all [--state open|closed|all] [--label <l>]
 
 Hinweis:
   teamctl ist ueber einen Symlink in einem PATH-Verzeichnis (z. B. ~/.local/bin)
@@ -648,6 +649,43 @@ git_issues() {
   printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (.[] | [.number, .state, .title, ((.labels // []) | map(.name) | join(",")), .html_url] | @tsv) else ((.message // "Fehler") | tostring) end'
 }
 
+
+git_issues_all() {
+  local state="open" label="" path enc
+  while [ $# -gt 0 ]; do case "$1" in
+    --state) [ $# -ge 2 ] || die "git issues-all: --state braucht einen Wert"; state="$2"; shift 2 ;;
+    --label) [ $# -ge 2 ] || die "git issues-all: --label braucht einen Wert"; label="$2"; shift 2 ;;
+    *) die "git issues-all: unbekannte Option '$1'" ;;
+  esac; done
+  case "$state" in open|closed|all) ;; *) die "git issues-all: ungueltiger --state '$state' (open|closed|all)" ;; esac
+  
+  path="/user/issues?state=$state&filter=all&per_page=100"
+  if [ -n "$label" ]; then
+    enc="$(jq -rn --arg l "$label" '$l|@uri')" || die "git issues-all: Label nicht kodierbar"
+    path="$path&labels=$enc"
+  fi
+  
+  gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
+  
+  printf '%s' "$GH_BODY" | jq -r '
+    if type=="array" then 
+      .[] 
+      | select(.pull_request == null) 
+      | [
+          (.repository.full_name // "?"), 
+          .number, 
+          .state, 
+          .title, 
+          ((.labels // []) | map(.name) | join(",")), 
+          .html_url
+        ] 
+      | @tsv 
+    else 
+      ((.message // "Fehler") | tostring) 
+    end'
+}
+
+
 git_cmd() {
   TOK="$(git_token)"
   local sub; sub="${1:-}"; shift || true
@@ -659,8 +697,9 @@ git_cmd() {
     issue) git_issue "$@" ;;
     issue-close) git_issue_close "$@" ;;
     issues) git_issues "$@" ;;
+    issues-all) git_issues_all "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "git: unbekannter Unterbefehl (info|list|create-repo|upload|issue|issue-close)" ;;
+    *) die "git: unbekannter Unterbefehl (info|list|create-repo|upload|issue|issue-close|issues-all)" ;;
   esac
 }
 
