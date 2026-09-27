@@ -175,6 +175,7 @@ GIT (GitHub, Konto per Token)
   teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
   teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
   teamctl git issue-close <repo> <nummer>
+  teamctl git issues <repo> [--state open|closed|all] [--label <l>]
 
 Hinweis:
   teamctl ist ueber einen Symlink in einem PATH-Verzeichnis (z. B. ~/.local/bin)
@@ -627,6 +628,26 @@ git_issue_close() {
   printf 'OK\t%s\t%s\t%s\t%s\n' "$GITHUB_OWNER/$repo" "$num" "$state" "$url"
 }
 
+git_issues() {
+  [ $# -ge 1 ] || die "git issues: <repo> fehlt"
+  local repo="$1"; shift
+  local state="open" label="" path enc
+  while [ $# -gt 0 ]; do case "$1" in
+    --state) [ $# -ge 2 ] || die "git issues: --state braucht einen Wert"; state="$2"; shift 2 ;;
+    --label) [ $# -ge 2 ] || die "git issues: --label braucht einen Wert"; label="$2"; shift 2 ;;
+    *) die "git issues: unbekannte Option '$1'" ;;
+  esac; done
+  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git issues: ungueltiger Repo-Name '$repo'"
+  case "$state" in open|closed|all) ;; *) die "git issues: ungueltiger --state '$state' (open|closed|all)" ;; esac
+  path="/repos/$GITHUB_OWNER/$repo/issues?state=$state&per_page=100"
+  if [ -n "$label" ]; then
+    enc="$(jq -rn --arg l "$label" '$l|@uri')" || die "git issues: Label nicht kodierbar"
+    path="$path&labels=$enc"
+  fi
+  gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
+  printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (.[] | [.number, .state, .title, ((.labels // []) | map(.name) | join(",")), .html_url] | @tsv) else ((.message // "Fehler") | tostring) end'
+}
+
 git_cmd() {
   TOK="$(git_token)"
   local sub; sub="${1:-}"; shift || true
@@ -637,6 +658,7 @@ git_cmd() {
     upload) git_upload "$@" ;;
     issue) git_issue "$@" ;;
     issue-close) git_issue_close "$@" ;;
+    issues) git_issues "$@" ;;
     ""|-h|--help|help) usage ;;
     *) die "git: unbekannter Unterbefehl (info|list|create-repo|upload|issue|issue-close)" ;;
   esac
