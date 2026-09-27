@@ -156,6 +156,7 @@ WIKI (Docmost)
   teamctl wiki spaces
   teamctl wiki pages <spaceId>
   teamctl wiki get <pageId>
+  teamctl wiki search <begriff>
   teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
   teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend]
   teamctl wiki upload <pageId> <bilddatei>
@@ -269,6 +270,43 @@ wiki_pages() {
   wiki_fetch_sidebar "$space" ""
   local items; items="$(printf '%s' "$WIKI_BODY" | jq -c '.data.items')"
   wiki_print_tree "$space" "$items" ""
+}
+
+# Flacht den Seitenbaum eines Spaces ab und gibt je Zeile
+# spaceSlug<TAB>pageId<TAB>title aus (fuer wiki search).
+wiki_collect_pages() {
+  local space="$1" slug="$2" json="$3" id title hc sub
+  while IFS=$'\t' read -r id title hc; do
+    [ -n "$id" ] || continue
+    printf '%s\t%s\t%s\n' "$slug" "$id" "$title"
+    if [ "$hc" = "true" ]; then
+      wiki_fetch_sidebar "$space" "$id"
+      sub="$(printf '%s' "$WIKI_BODY" | jq -c '.data.items')"
+      wiki_collect_pages "$space" "$slug" "$sub"
+    fi
+  done < <(printf '%s' "$json" | jq -r '.[] | [.id, .title, (.hasChildren|tostring)] | @tsv')
+}
+
+# Sucht seitenuebergreifend nach Seitentiteln (case-insensitive, fester String).
+# Ausgabe: spaceSlug<TAB>pageId<TAB>title.
+wiki_search() {
+  [ $# -ge 1 ] || die "wiki search: <begriff> fehlt"
+  local q="$1" tmp
+  [ -n "$q" ] || die "wiki search: Suchbegriff leer"
+  wiki_login "$WIKI_AS"
+  wiki_api_or_die "spaces/" '{}'
+  local spaces
+  spaces="$(printf '%s' "$WIKI_BODY" | jq -r '.data.items[] | [.id, .slug] | @tsv')"
+  [ -n "$spaces" ] || die "wiki search: keine Spaces sichtbar"
+  tmp="$(mktmp)"
+  local sid slug items
+  while IFS=$'\t' read -r sid slug; do
+    [ -n "$sid" ] || continue
+    wiki_fetch_sidebar "$sid" "" || continue
+    items="$(printf '%s' "$WIKI_BODY" | jq -c '.data.items')"
+    wiki_collect_pages "$sid" "$slug" "$items" >> "$tmp"
+  done <<< "$spaces"
+  grep -iF -- "$q" "$tmp" | sort -f -t $'\t' -k3,3
 }
 
 wiki_get() {
@@ -403,13 +441,14 @@ wiki_cmd() {
     spaces) wiki_spaces ;;
     pages)  wiki_pages "$@" ;;
     get)    wiki_get "$@" ;;
+    search) wiki_search "$@" ;;
     create) wiki_create "$@" ;;
     update) wiki_update "$@" ;;
     upload) wiki_upload "$@" ;;
     me) wiki_me "$@" ;;
     profile) wiki_profile "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "wiki: unbekannter Unterbefehl (spaces|pages|get|create|update|upload)" ;;
+    *) die "wiki: unbekannter Unterbefehl (spaces|pages|get|search|create|update|upload)" ;;
   esac
 }
 
