@@ -174,9 +174,9 @@ stdout-Ausgabe nicht (Hinweise gehen ausschliesslich auf stderr).
 
 ## Selbsttest (Regressions-Guard)
 
-`tests/selftest.sh` prueft Syntax, das Fehlen jeglicher Shell-Auswertung
-(`eval`) im Token-Pfad und die Ablehnung von Metazeichen in
-`TEAMCTL_GITHUB_TOKEN_CMD`:
+`tests/selftest.sh` prueft Syntax, das dateiweite Fehlen jeglicher
+Shell-Auswertung (`eval`) im Kommandokontext und die Ablehnung von
+Metazeichen in `TEAMCTL_GITHUB_TOKEN_CMD`:
 
 ```bash
 bash tests/selftest.sh
