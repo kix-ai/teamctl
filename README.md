@@ -120,6 +120,11 @@ die jeweiligen Unterbefehle.
 
 - Daten auf stdout, Hinweis-/Statuszeilen auf stderr, TAB-getrennt.
 - Bei Fehlern Klartext, HTTP-Code und Exit-Code ungleich 0.
+- Listen-Befehle (`git repos`, `git branches`, `git commits`, `git list`,
+  `git issues`, `git issues-all`, `git pulls`, `git pulls-all`) erwarten ein
+  JSON-Array. Bei leerer oder unerwarteter API-Antwort bricht `teamctl` ab
+  (Meldung auf stderr, Exit-Code ungleich 0) - kein stiller Erfolg mit
+  Fehlertext auf stdout.
 - Bei HTTP 429 wiederholt `teamctl` Wiki-Aufrufe automatisch (begrenztes
   Backoff mit Jitter, `Retry-After` wird beachtet).
 - Alle Schreibbefehle machen einen Read-back und schlagen fehl, wenn das Ergebnis
