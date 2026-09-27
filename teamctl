@@ -171,6 +171,7 @@ BLOG (statische Seite auf dem Infra-Host)
 
 GIT (GitHub, Konto per Token)
   teamctl git info <repo>
+  teamctl git repos
   teamctl git list <repo> [dir]
   teamctl git create-repo <name> [--public]
   teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
@@ -557,6 +558,11 @@ gh_api() {
 
 git_err() { printf '%s' "$GH_BODY" | jq -r '.message // empty' 2>/dev/null | head -1; }
 
+git_repos() {
+  gh_api GET "/user/repos?per_page=100&sort=full_name" "" || die "HTTP $GH_HTTP: $(git_err)"
+  printf '%s' "$GH_BODY" | jq -r '.[] | [.name, (if .private then "private" else "public" end), .default_branch, .pushed_at, .html_url] | @tsv'
+}
+
 git_info() {
   [ $# -ge 1 ] || die "git info: <repo> fehlt"
   local repo="$1"
@@ -827,6 +833,7 @@ git_cmd() {
   local sub; sub="${1:-}"; shift || true
   case "$sub" in
     info) git_info "$@" ;;
+    repos) git_repos "$@" ;;
     list) git_list "$@" ;;
     create-repo) git_create_repo "$@" ;;
     upload) git_upload "$@" ;;
@@ -839,7 +846,7 @@ git_cmd() {
     issues) git_issues "$@" ;;
     issues-all) git_issues_all "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "git: unbekannter Unterbefehl (info|list|create-repo|upload|read|cat|clone|pull|issue|issue-close|issues|issues-all)" ;;
+    *) die "git: unbekannter Unterbefehl (info|repos|list|create-repo|upload|read|cat|clone|pull|issue|issue-close|issues|issues-all)" ;;
   esac
 }
 
