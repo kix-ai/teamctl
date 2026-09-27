@@ -80,6 +80,14 @@ require_config() {
   if [ "${#missing[@]}" -gt 0 ]; then
     config_error "Konfiguration unvollstaendig - fehlt: ${missing[*]}"
   fi
+  # Sicherheit: der Bearer-Token darf nie ueber Klartext-HTTP gehen - deshalb
+  # ist ausschliesslich "https://" erlaubt (exakt klein geschrieben, kein
+  # Gross-/Kleinschreibungs-Trick). Die Meldung nennt nur den Schluesselnamen
+  # TEAMCTL_GIT_API - nie den Wert/die URL.
+  case "$GITHUB_API" in
+    https://*) ;;
+    *) config_error "TEAMCTL_GIT_API: ungueltig - die API muss mit https:// beginnen" ;;
+  esac
 }
 
 CURL_OPTS=(-sk --max-time 60)
@@ -668,8 +676,21 @@ gh_api() {
 
 git_err() { printf '%s' "$GH_BODY" | jq -r '.message // empty' 2>/dev/null | head -1; }
 
+# git_expect_array <kontext>
+# Gemeinsamer Helper fuer die listen-artigen git_*-Funktionen: bricht ab
+# (Meldung auf stderr, Exit 1), wenn GH_BODY leer oder kein JSON-Array ist.
+# Vorher gaben manche Funktionen bei einem GitHub-Fehlerobjekt (.message)
+# Text auf STDOUT aus und endeten mit exit 0 (stiller Erfolg) - jetzt ist das
+# ein harter Fehler. Die Ausgabe im Array-Fall bleibt unveraendert.
+git_expect_array() {
+  local who="$1"
+  [ -n "$GH_BODY" ] || die "$who: leere API-Antwort"
+  printf '%s' "$GH_BODY" | jq -e 'type=="array"' >/dev/null 2>&1 || die "$who: unerwartete API-Antwort: $(git_err)"
+}
+
 git_repos() {
   gh_api GET "/user/repos?per_page=100&sort=full_name" "" || die "HTTP $GH_HTTP: $(git_err)"
+  git_expect_array "git repos"
   printf '%s' "$GH_BODY" | jq -r '.[] | [.name, (if .private then "private" else "public" end), .default_branch, .pushed_at, .html_url] | @tsv'
 }
 
@@ -690,7 +711,8 @@ git_branches() {
   local repo="$1"
   git_require_repo "git branches" "$repo"
   gh_api GET "/repos/$GITHUB_OWNER/$repo/branches?per_page=100" "" || die "HTTP $GH_HTTP: $(git_err)"
-  printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (sort_by(.name)[] | [.name, (.commit.sha[0:7]), ((.protected // false)|tostring)] | @tsv) else ((.message // "Fehler")|tostring) end'
+  git_expect_array "git branches"
+  printf '%s' "$GH_BODY" | jq -r 'sort_by(.name)[] | [.name, (.commit.sha[0:7]), ((.protected // false)|tostring)] | @tsv'
 }
 
 # git_commits <repo> [--n <anzahl>]
@@ -712,9 +734,7 @@ git_commits() {
     die "git commits: --n ausserhalb 1..100 ('$n')"
   fi
   gh_api GET "/repos/$GITHUB_OWNER/$repo/commits?per_page=$n" "" || die "HTTP $GH_HTTP: $(git_err)"
-  if ! printf '%s' "$GH_BODY" | jq -e 'type=="array"' >/dev/null 2>&1; then
-    die "git commits: unerwartete API-Antwort: $(git_err)"
-  fi
+  git_expect_array "git commits"
   printf '%s' "$GH_BODY" | jq -r '
     .[] | [
       (.sha[0:7]),
@@ -736,7 +756,8 @@ git_list() {
     path="$path/$dir_enc"
   fi
   gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
-  printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (.[] | [.type, (.size|tostring), .path] | @tsv) else [.type, (.size|tostring), .path] | @tsv end'
+  git_expect_array "git list"
+  printf '%s' "$GH_BODY" | jq -r '.[] | [.type, (.size|tostring), .path] | @tsv'
 }
 
 git_create_repo() {
@@ -969,7 +990,8 @@ git_issues() {
   git_require_repo "git issues" "$repo"
   path="$(git_list_path "/repos/$GITHUB_OWNER/$repo/issues?state=$GIT_LIST_STATE&per_page=100")"
   gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
-  printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (.[] | [.number, .state, .title, ((.labels // []) | map(.name) | join(",")), .html_url] | @tsv) else ((.message // "Fehler") | tostring) end'
+  git_expect_array "git issues"
+  printf '%s' "$GH_BODY" | jq -r '.[] | [.number, .state, .title, ((.labels // []) | map(.name) | join(",")), .html_url] | @tsv'
 }
 
 git_issues_all() {
@@ -977,8 +999,8 @@ git_issues_all() {
   git_list_opts "git issues-all" "$@"
   path="$(git_list_path "/user/issues?state=$GIT_LIST_STATE&filter=all&per_page=100")"
   gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
+  git_expect_array "git issues-all"
   printf '%s' "$GH_BODY" | jq -r '
-    if type=="array" then
       .[]
       | select(.pull_request == null)
       | [
@@ -989,10 +1011,7 @@ git_issues_all() {
           ((.labels // []) | map(.name) | join(",")),
           .html_url
         ]
-      | @tsv
-    else
-      ((.message // "Fehler") | tostring)
-    end'
+      | @tsv'
 }
 
 # git_pulls <repo> [--state open|closed|all] [--label <l>]
@@ -1006,7 +1025,8 @@ git_pulls() {
   git_require_repo "git pulls" "$repo"
   path="$(git_list_path "/repos/$GITHUB_OWNER/$repo/pulls?state=$GIT_LIST_STATE&per_page=100")"
   gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
-  printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (.[] | [.number, .state, .title, ((.labels // []) | map(.name) | join(",")), (.user.login // ""), .html_url] | @tsv) else ((.message // "Fehler") | tostring) end'
+  git_expect_array "git pulls"
+  printf '%s' "$GH_BODY" | jq -r '.[] | [.number, .state, .title, ((.labels // []) | map(.name) | join(",")), (.user.login // ""), .html_url] | @tsv'
 }
 
 # git_pulls_all [--state open|closed|all] [--label <l>]
@@ -1017,8 +1037,8 @@ git_pulls_all() {
   git_list_opts "git pulls-all" "$@"
   path="$(git_list_path "/user/issues?state=$GIT_LIST_STATE&filter=all&per_page=100")"
   gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
+  git_expect_array "git pulls-all"
   printf '%s' "$GH_BODY" | jq -r '
-    if type=="array" then
       .[]
       | select(.pull_request != null)
       | [
@@ -1030,10 +1050,7 @@ git_pulls_all() {
           (.user.login // ""),
           .html_url
         ]
-      | @tsv
-    else
-      ((.message // "Fehler") | tostring)
-    end'
+      | @tsv'
 }
 
 git_cmd() {
