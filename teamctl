@@ -613,7 +613,8 @@ git_commits() {
     *) die "git commits: unbekannte Option '$1'" ;;
   esac; done
   git_require_repo "git commits" "$repo"
-  [[ "$n" =~ ^[0-9]+$ ]] || die "git commits: ungueltiges --n '$n' (Ganzzahl 1..100)"
+  [[ "$n" =~ ^[0-9]{1,3}$ ]] || die "git commits: ungueltiges --n '$n' (Ganzzahl 1..100)"
+  n=$((10#$n))
   if [ "$n" -lt 1 ] || [ "$n" -gt 100 ]; then
     die "git commits: --n ausserhalb 1..100 ('$n')"
   fi
@@ -626,7 +627,7 @@ git_commits() {
       (.sha[0:7]),
       (.commit.author.date // ""),
       (.author.login // .commit.author.name // ""),
-      ((.commit.message // "") | split("\n")[0])
+      ((.commit.message // "") | split("\n")[0] | gsub("\t"; " ") | gsub("[\r\n]"; " "))
     ] | @tsv'
 }
 
