@@ -25,6 +25,9 @@ GIT (GitHub; Standard privat)
     teamctl git list <repo> [dir]
     teamctl git create-repo <name> [--public]
     teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
+    teamctl git read <repo> <pfad> [--ref <branch>]      # Alias: git cat
+    teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
+    teamctl git pull <dir>
     teamctl git issues <repo> [--state open|closed|all] [--label <l>]
 
 ## Konventionen
@@ -33,6 +36,9 @@ GIT (GitHub; Standard privat)
 - Jeder Schreibbefehl prueft das Ergebnis per Read-back und bricht bei
   Abweichung ab (Exit-Code != 0).
 - Keine Secrets in Ausgaben; Token/Passwoerter werden nur zur Laufzeit gelesen.
+- `git read`/`git cat` geben den Dateiinhalt ueber die GitHub-Contents-API aus.
+- `git clone`/`git pull` holen das Token intern als HTTP-Header (nie in URL,
+  Kommandozeile oder Ausgabe) und speichern es NICHT im geklonten Repo.
 
 ## Konfiguration
 
