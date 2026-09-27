@@ -29,7 +29,7 @@ CONFIG_FILE="${TEAMCTL_ENV_FILE:-$SELF_DIR/teamctl.env}"
 CONFIG_KEYS=(
   TEAMCTL_INFRA_HOST TEAMCTL_WIKI_URL TEAMCTL_WIKI_EMAIL TEAMCTL_BLOG_ROOT
   TEAMCTL_GIT_OWNER TEAMCTL_GIT_API TEAMCTL_GITHUB_TOKEN_CMD
-  TEAMCTL_SSH_KEY TEAMCTL_WIKI_CREDS TEAMCTL_WIKI_AS
+  TEAMCTL_SSH_KEY TEAMCTL_WIKI_CREDS TEAMCTL_WIKI_AS TEAMCTL_WIKI_CA
 )
 
 declare -A _ENV_SAVE=()
@@ -45,6 +45,32 @@ for _k in "${CONFIG_KEYS[@]}"; do
   if [ -n "${_ENV_SAVE[$_k]}" ]; then export "$_k=${_ENV_SAVE[$_k]}"; fi
 done
 unset _ENV_SAVE _k
+
+# TLS-Verifikation fuer das Wiki (Leaf == CA, selbstsigniert).
+# Nur der Pfad zur CA-Datei kommt aus der Konfiguration; der Dateiinhalt
+# (Zertifikat) liegt ausserhalb von Git. Meldungen nennen nur den
+# Schluesselnamen, nie den Wert/Pfad.
+TEAMCTL_WIKI_CA="${TEAMCTL_WIKI_CA:-}"
+
+# curl-Argumente fuer Wiki-Aufrufe. Leer = System-CA, sonst explizite CA.
+WIKI_CURL_OPTS=()
+
+# wiki_ca_opts - CA-Option fuer Wiki-curl-Aufrufe.
+# Ist TEAMCTL_WIKI_CA gesetzt, muss die Datei existieren, nicht leer und
+# lesbar sein; sonst fail-fast (nur der Schluesselname wird genannt).
+wiki_ca_opts() {
+  if [ -z "$TEAMCTL_WIKI_CA" ]; then
+    WIKI_CURL_OPTS=()
+    return 0
+  fi
+  if [ ! -f "$TEAMCTL_WIKI_CA" ]; then
+    die "TEAMCTL_WIKI_CA gesetzt, aber CA-Datei fehlt oder ist keine regulaere Datei."
+  fi
+  if [ ! -r "$TEAMCTL_WIKI_CA" ] || [ ! -s "$TEAMCTL_WIKI_CA" ]; then
+    die "TEAMCTL_WIKI_CA gesetzt, aber CA-Datei ist leer oder nicht lesbar."
+  fi
+  WIKI_CURL_OPTS=(--cacert "$TEAMCTL_WIKI_CA")
+}
 
 # Pflichtwerte - bewusst OHNE Default im Skript (Infra ist austauschbar).
 INFRA_HOST="${TEAMCTL_INFRA_HOST:-}"
@@ -95,7 +121,7 @@ require_https_endpoints() {
   esac
 }
 
-CURL_OPTS=(-sk --max-time 60)
+CURL_OPTS=(-s --max-time 60)
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15)
 
 TOK=""
@@ -146,9 +172,10 @@ retry_delay() {
 wiki_http() {
   local out="$1"; shift
   local hdr attempt=0 code delay ra
+  wiki_ca_opts
   hdr="$(mktmp)"
   while :; do
-    code="$(curl "${CURL_OPTS[@]}" -D "$hdr" -o "$out" -w '%{http_code}' "$@")"
+    code="$(curl "${CURL_OPTS[@]}" "${WIKI_CURL_OPTS[@]}" -D "$hdr" -o "$out" -w '%{http_code}' "$@")"
     if [ "$code" != "429" ]; then printf '%s' "$code"; return 0; fi
     if [ "$attempt" -ge "$TEAMCTL_RETRY_MAX" ]; then
       note "Wiki: HTTP 429 (Too Many Requests) - $TEAMCTL_RETRY_MAX Wiederholungen erschoepft, gebe auf"
@@ -212,6 +239,7 @@ Hinweis:
 Konfiguration: siehe teamctl.env im Skript-Verzeichnis (Vorlage: .env.example).
            TEAMCTL_INFRA_HOST TEAMCTL_WIKI_URL TEAMCTL_WIKI_EMAIL TEAMCTL_BLOG_ROOT
            TEAMCTL_GIT_OWNER TEAMCTL_GIT_API TEAMCTL_SSH_KEY TEAMCTL_WIKI_CREDS
+           TEAMCTL_WIKI_CA
 EOF
 }
 
