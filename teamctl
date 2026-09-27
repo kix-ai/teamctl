@@ -912,15 +912,37 @@ git_pull() {
   fi
 }
 
+# git_author_ok <title> <body>
+# Prueft die Ersteller-Kennung der Konvention: Titel beginnt mit "[<agent-id>]",
+# Body beginnt mit "Ersteller:" (gefolgt von "Datum: <YYYY-MM-DD>").
+# Quelle der Konvention: Wiki "Team & Koordination" -> "Richtlinien & Vorgaben".
+# Rueckgabe: 0 = beide Kennungen vorhanden, 1 = mindestens eine fehlt.
+git_author_ok() {
+  local title="$1" body="$2"
+  case "$title" in "["*) ;; *) return 1 ;; esac
+  case "$body" in "Ersteller:"*) ;; *) return 1 ;; esac
+  return 0
+}
+
+# git_author_hint - Konventionshinweis auf stderr.
+# Nennt nur Platzhalter/Schluesselnamen (keine Secrets, keine Infra-Werte).
+git_author_hint() {
+  printf 'teamctl: Konvention: Titel-Praefix "[<agent-id>]", Body-Beginn "Ersteller: <agent-id>" und "Datum: <YYYY-MM-DD>".\n' >&2
+  printf 'teamctl: Quelle: Wiki "Team & Koordination" -> "Richtlinien & Vorgaben".\n' >&2
+}
+
 git_issue() {
   [ $# -ge 1 ] || die "git issue: <repo> fehlt"
   local repo="$1"; shift
   local title="" body="" file="" label="" payload num url state
+  local require_author=0 author=""
   while [ $# -gt 0 ]; do case "$1" in
     --title) [ $# -ge 2 ] || die "git issue: --title braucht einen Wert"; title="$2"; shift 2 ;;
     --body)  [ $# -ge 2 ] || die "git issue: --body braucht einen Wert"; body="$2"; shift 2 ;;
     --file)  [ $# -ge 2 ] || die "git issue: --file braucht einen Wert"; file="$2"; shift 2 ;;
     --label) [ $# -ge 2 ] || die "git issue: --label braucht einen Wert"; label="$2"; shift 2 ;;
+    --author) [ $# -ge 2 ] || die "git issue: --author braucht einen Wert"; author="$2"; shift 2 ;;
+    --require-author) require_author=1; shift ;;
     *) die "git issue: unbekannte Option '$1'" ;;
   esac; done
   git_owner_repo "git issue" "$repo"
@@ -931,6 +953,35 @@ git_issue() {
     body="$(cat "$file")"
   fi
   [ -n "$body" ] || die "git issue: --body oder --file fehlt (Text des Wunsches)"
+  # Optionales Hilfsflag --author: Kennung automatisch setzen.
+  # Titel-Praefix "[<agent-id>] " nur, wenn der Titel noch nicht mit "[" beginnt.
+  # Body-Beginn "Ersteller: <agent-id>" + "Datum: <YYYY-MM-DD>" nur, wenn der
+  # Body nicht schon mit "Ersteller:" beginnt (idempotent).
+  if [ -n "$author" ]; then
+    case "$title" in
+      "["*) ;;
+      *) title="[$author] $title" ;;
+    esac
+    case "$body" in
+      "Ersteller:"*) ;;
+      *) body="Ersteller: $author
+Datum: $(date -u +%Y-%m-%d)
+$body" ;;
+    esac
+  fi
+  # Ersteller-Kennung pruefen (Konvention: Wiki "Team & Koordination"
+  # -> "Richtlinien & Vorgaben"). Standard: nur Warnung auf stderr, Exit 0.
+  # Mit --require-author: harter Abbruch VOR jedem API-Aufruf (kein Issue).
+  if ! git_author_ok "$title" "$body"; then
+    if [ "$require_author" = "1" ]; then
+      printf 'teamctl: FEHLER: git issue: Ersteller-Kennung fehlt/unvollstaendig (--require-author) - kein Issue angelegt.\n' >&2
+      git_author_hint
+      printf 'teamctl: Abhilfe: Titel/Body anpassen oder --author <agent-id> verwenden.\n' >&2
+      exit 1
+    fi
+    printf 'teamctl: WARNUNG: git issue: Ersteller-Kennung unvollstaendig - Issue wird trotzdem angelegt (strikt: --require-author).\n' >&2
+    git_author_hint
+  fi
   if [ -n "$label" ]; then
     payload="$(jq -nc --arg t "$title" --arg b "$body" --arg l "$label" '{title:$t, body:$b, labels:($l|split(","))}')"
   else
