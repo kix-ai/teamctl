@@ -549,6 +549,17 @@ git_repo_ok() {
   return 0
 }
 
+# Datei-/Verzeichnispfade pruefen: leere Pfade, "." und ".." sowie absolute
+# Pfade (fuehrendes "/") ablehnen, damit keine API-Pfade wie
+# /repos/$GITHUB_OWNER/$repo/contents/../... entstehen.
+git_path_ok() {
+  local p="$1"
+  [ -n "$p" ] || return 1
+  case "$p" in .|..) return 1 ;; esac
+  case "$p" in /*) return 1 ;; esac
+  return 0
+}
+
 # Kodiert ein Pfadsegment bzw. einen Branch-Namen fuer die GitHub-Contents-API
 # (RFC-3986, jq @uri). Gemeinsamer Helper fuer git_list/git_upload/git_read,
 # damit Pfade mit Leerzeichen, #, ?, &, % nicht falsch interpretiert werden.
@@ -645,6 +656,7 @@ git_list() {
   if [ $# -ge 2 ]; then dir="$2"; fi
   path="/repos/$GITHUB_OWNER/$repo/contents"
   if [ -n "$dir" ]; then
+    git_path_ok "$dir" || die "git list: ungueltiger Pfad '$dir'"
     dir_enc="$(git_uri_enc "$dir")" || die "git list: Verzeichnis nicht kodierbar"
     path="$path/$dir_enc"
   fi
@@ -670,6 +682,7 @@ git_upload() {
   [ $# -ge 3 ] || die "git upload: <repo> <pfad> <lokale-datei> fehlt"
   local repo="$1" path="$2" file="$3"; shift 3
   git_require_repo "git upload" "$repo"
+  git_path_ok "$path" || die "git upload: ungueltiger Pfad '$path'"
   local enc; enc="$(git_uri_enc "$path")" || die "git upload: Pfad nicht kodierbar"
   local msg="teamctl: update $path" sha="" body newsha rsha rsize lsize b64
   while [ $# -gt 0 ]; do case "$1" in
@@ -713,6 +726,7 @@ git_read() {
   esac; done
   git_require_repo "git read" "$repo"
   [ -n "$path" ] || die "git read: <pfad> fehlt"
+  git_path_ok "$path" || die "git read: ungueltiger Pfad '$path'"
   enc="$(git_uri_enc "$path")" || die "git read: Pfad nicht kodierbar"
   api="/repos/$GITHUB_OWNER/$repo/contents/$enc"
   if [ -n "$ref" ]; then
@@ -859,7 +873,7 @@ git_list_opts() {
   esac; done
   case "$GIT_LIST_STATE" in open|closed|all) ;; *) die "$who: ungueltiger --state '$GIT_LIST_STATE' (open|closed|all)" ;; esac
   if [ -n "$GIT_LIST_LABEL" ]; then
-    GIT_LIST_LABEL_ENC="$(jq -rn --arg l "$GIT_LIST_LABEL" '$l|@uri')" || die "$who: Label nicht kodierbar"
+    GIT_LIST_LABEL_ENC="$(git_uri_enc "$GIT_LIST_LABEL")" || die "$who: Label nicht kodierbar"
   fi
 }
 
