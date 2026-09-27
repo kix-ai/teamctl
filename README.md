@@ -38,6 +38,7 @@ WIKI (Docmost)
     teamctl wiki spaces
     teamctl wiki pages <spaceId>
     teamctl wiki get <pageId>
+    teamctl wiki search <begriff>
     teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
     teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend]
     teamctl wiki upload <pageId> <bilddatei>
