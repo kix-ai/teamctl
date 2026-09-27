@@ -51,6 +51,7 @@ BLOG (statische Seite auf dem Infra-Host)
 
 GIT (GitHub, Konto per Token)
     teamctl git info <repo>
+    teamctl git branches <repo>                    # Branches: name, sha(kurz), protected (TAB, sortiert)
     teamctl git repos                              # alle Repos des Kontos (TAB)
     teamctl git list <repo> [dir]
     teamctl git create-repo <name> [--public]     # Standard: privat
