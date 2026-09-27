@@ -172,6 +172,21 @@ stdout-Ausgabe nicht (Hinweise gehen ausschliesslich auf stderr).
 - Ohne `TEAMCTL_WIKI_CA` nutzen Wiki-Aufrufe die System-CA. Fuer ein
   selbstsigniertes Wiki muss der Schluessel gesetzt sein.
 
+## Selbsttest (Regressions-Guard)
+
+`tests/selftest.sh` prueft Syntax, das Fehlen jeglicher Shell-Auswertung
+(`eval`) im Token-Pfad und die Ablehnung von Metazeichen in
+`TEAMCTL_GITHUB_TOKEN_CMD`:
+
+```bash
+bash tests/selftest.sh
+```
+
+Exit 0 = alle Tests PASS, Exit != 0 = mindestens ein FAIL. Der Test laeuft ohne
+Secrets und ohne Infrastruktur (Dummy-Konfiguration mit `.invalid`-Werten und
+curl-Stub). Ein optionaler Live-Positivtest (`teamctl git repos`, Exit 0) ist
+mit `TEAMCTL_SELFTEST_LIVE=1` aktivierbar.
+
 ## Lizenz
 
 MIT - siehe `LICENSE`.
