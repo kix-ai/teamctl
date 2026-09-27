@@ -172,6 +172,7 @@ BLOG (statische Seite auf dem Infra-Host)
 GIT (GitHub, Konto per Token)
   teamctl git info <repo>
   teamctl git branches <repo>
+  teamctl git commits <repo> [--n <anzahl>]
   teamctl git repos
   teamctl git list <repo> [dir]
   teamctl git create-repo <name> [--public]
@@ -536,6 +537,21 @@ blog_cmd() {
 # ---------------- Git (GitHub) ----------------
 GIT_REPO_RE='^[A-Za-z0-9._-]+$'
 
+# Repo-Namen pruefen: erlaubte Zeichen UND keine relativen Pfad-Aliase.
+# "." und ".." passen auf ^[A-Za-z0-9._-]+$ und wuerden sonst in API-Pfade
+# wie /repos/$GITHUB_OWNER/../... gelangen - daher explizit ablehnen.
+git_repo_ok() {
+  local name="$1"
+  [[ "$name" =~ $GIT_REPO_RE ]] || return 1
+  case "$name" in .|..) return 1 ;; esac
+  return 0
+}
+
+git_require_repo() {
+  local who="$1" name="$2"
+  git_repo_ok "$name" || die "$who: ungueltiger Repo-Name '$name'"
+}
+
 git_token() {
   local t
   t="$(eval "$GITHUB_TOKEN_CMD" 2>/dev/null)" || die "git: Token nicht lesbar ($GITHUB_TOKEN_CMD)"
@@ -567,6 +583,7 @@ git_repos() {
 git_info() {
   [ $# -ge 1 ] || die "git info: <repo> fehlt"
   local repo="$1"
+  git_require_repo "git info" "$repo"
   gh_api GET "/repos/$GITHUB_OWNER/$repo" "" || die "HTTP $GH_HTTP: $(git_err)"
   printf '%s' "$GH_BODY" | jq -r '"full_name\t\(.full_name)", "private\t\(.private)", "default_branch\t\(.default_branch)", "description\t\(.description // "")", "html_url\t\(.html_url)", "size_kb\t\(.size)"'
 }
@@ -578,14 +595,45 @@ git_info() {
 git_branches() {
   [ $# -ge 1 ] || die "git branches: <repo> fehlt"
   local repo="$1"
-  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git branches: ungueltiger Repo-Name '$repo'"
+  git_require_repo "git branches" "$repo"
   gh_api GET "/repos/$GITHUB_OWNER/$repo/branches?per_page=100" "" || die "HTTP $GH_HTTP: $(git_err)"
   printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (sort_by(.name)[] | [.name, (.commit.sha[0:7]), ((.protected // false)|tostring)] | @tsv) else ((.message // "Fehler")|tostring) end'
+}
+
+# git_commits <repo> [--n <anzahl>]
+# Listet die letzten Commits eines Repos (read-only) TAB-getrennt:
+#   sha(kurz, 7)<TAB>iso-datum<TAB>author-login<TAB>nachricht (erste Zeile)
+# Option --n: Anzahl 1..100 (Default 10).
+git_commits() {
+  [ $# -ge 1 ] || die "git commits: <repo> fehlt"
+  local repo="$1"; shift
+  local n=10
+  while [ $# -gt 0 ]; do case "$1" in
+    --n) [ $# -ge 2 ] || die "git commits: --n braucht einen Wert"; n="$2"; shift 2 ;;
+    *) die "git commits: unbekannte Option '$1'" ;;
+  esac; done
+  git_require_repo "git commits" "$repo"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "git commits: ungueltiges --n '$n' (Ganzzahl 1..100)"
+  if [ "$n" -lt 1 ] || [ "$n" -gt 100 ]; then
+    die "git commits: --n ausserhalb 1..100 ('$n')"
+  fi
+  gh_api GET "/repos/$GITHUB_OWNER/$repo/commits?per_page=$n" "" || die "HTTP $GH_HTTP: $(git_err)"
+  if ! printf '%s' "$GH_BODY" | jq -e 'type=="array"' >/dev/null 2>&1; then
+    die "git commits: unerwartete API-Antwort: $(git_err)"
+  fi
+  printf '%s' "$GH_BODY" | jq -r '
+    .[] | [
+      (.sha[0:7]),
+      (.commit.author.date // ""),
+      (.author.login // .commit.author.name // ""),
+      ((.commit.message // "") | split("\n")[0])
+    ] | @tsv'
 }
 
 git_list() {
   [ $# -ge 1 ] || die "git list: <repo> fehlt"
   local repo="$1" dir="" path
+  git_require_repo "git list" "$repo"
   if [ $# -ge 2 ]; then dir="$2"; fi
   path="/repos/$GITHUB_OWNER/$repo/contents"
   if [ -n "$dir" ]; then path="$path/$dir"; fi
@@ -610,6 +658,7 @@ git_create_repo() {
 git_upload() {
   [ $# -ge 3 ] || die "git upload: <repo> <pfad> <lokale-datei> fehlt"
   local repo="$1" path="$2" file="$3"; shift 3
+  git_require_repo "git upload" "$repo"
   local msg="teamctl: update $path" sha="" body newsha rsha rsize lsize b64
   while [ $# -gt 0 ]; do case "$1" in
     --message) [ $# -ge 2 ] || die "git upload: --message braucht einen Wert"; msg="$2"; shift 2 ;;
@@ -650,7 +699,7 @@ git_read() {
     --ref) [ $# -ge 2 ] || die "git read: --ref braucht einen Wert"; ref="$2"; shift 2 ;;
     *) die "git read: unbekannte Option '$1'" ;;
   esac; done
-  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git read: ungueltiger Repo-Name '$repo'"
+  git_require_repo "git read" "$repo"
   [ -n "$path" ] || die "git read: <pfad> fehlt"
   enc="$(jq -rn --arg p "$path" '$p|@uri')" || die "git read: Pfad nicht kodierbar"
   api="/repos/$GITHUB_OWNER/$repo/contents/$enc"
@@ -686,7 +735,7 @@ git_clone() {
        else die "git clone: zu viele Argumente ('$1')"; fi
        shift ;;
   esac; done
-  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git clone: ungueltiger Repo-Name '$repo'"
+  git_require_repo "git clone" "$repo"
   [ -n "$dir" ] || dir="$repo"
   [ -e "$dir" ] && die "git clone: Ziel existiert bereits: $dir"
   local url="https://github.com/$GITHUB_OWNER/$repo.git" hdr ef sha br n
@@ -743,7 +792,7 @@ git_issue() {
     --label) [ $# -ge 2 ] || die "git issue: --label braucht einen Wert"; label="$2"; shift 2 ;;
     *) die "git issue: unbekannte Option '$1'" ;;
   esac; done
-  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git issue: ungueltiger Repo-Name '$repo'"
+  git_require_repo "git issue" "$repo"
   [ -n "$title" ] || die "git issue: --title fehlt"
   if [ -n "$file" ] && [ -n "$body" ]; then die "git issue: --body und --file nicht gleichzeitig"; fi
   if [ -n "$file" ]; then
@@ -771,7 +820,7 @@ git_issue() {
 git_issue_close() {
   [ $# -ge 2 ] || die "git issue-close: <repo> <nummer> fehlt"
   local repo="$1" num="$2" payload state url
-  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git issue-close: ungueltiger Repo-Name '$repo'"
+  git_require_repo "git issue-close" "$repo"
   [[ "$num" =~ ^[0-9]+$ ]] || die "git issue-close: ungueltige Nummer '$num'"
   payload='{"state":"closed"}'
   gh_api PATCH "/repos/$GITHUB_OWNER/$repo/issues/$num" "$payload" || die "HTTP $GH_HTTP: $(git_err)"
@@ -793,7 +842,7 @@ git_issues() {
     --label) [ $# -ge 2 ] || die "git issues: --label braucht einen Wert"; label="$2"; shift 2 ;;
     *) die "git issues: unbekannte Option '$1'" ;;
   esac; done
-  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git issues: ungueltiger Repo-Name '$repo'"
+  git_require_repo "git issues" "$repo"
   case "$state" in open|closed|all) ;; *) die "git issues: ungueltiger --state '$state' (open|closed|all)" ;; esac
   path="/repos/$GITHUB_OWNER/$repo/issues?state=$state&per_page=100"
   if [ -n "$label" ]; then
@@ -847,6 +896,7 @@ git_cmd() {
   case "$sub" in
     info) git_info "$@" ;;
     branches) git_branches "$@" ;;
+    commits) git_commits "$@" ;;
     repos) git_repos "$@" ;;
     list) git_list "$@" ;;
     create-repo) git_create_repo "$@" ;;
@@ -860,7 +910,7 @@ git_cmd() {
     issues) git_issues "$@" ;;
     issues-all) git_issues_all "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "git: unbekannter Unterbefehl (info|branches|repos|list|create-repo|upload|read|cat|clone|pull|issue|issue-close|issues|issues-all)" ;;
+    *) die "git: unbekannter Unterbefehl (info|branches|commits|repos|list|create-repo|upload|read|cat|clone|pull|issue|issue-close|issues|issues-all)" ;;
   esac
 }
 
