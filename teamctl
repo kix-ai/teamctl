@@ -185,6 +185,8 @@ GIT (GitHub, Konto per Token)
   teamctl git issue-close <repo> <nummer>
   teamctl git issues <repo> [--state open|closed|all] [--label <l>]
   teamctl git issues-all [--state open|closed|all] [--label <l>]
+  teamctl git pulls <repo> [--state open|closed|all] [--label <l>]
+  teamctl git pulls-all [--state open|closed|all] [--label <l>]
 
 Hinweis:
   teamctl ist ueber einen Symlink in einem PATH-Verzeichnis (z. B. ~/.local/bin)
@@ -843,62 +845,107 @@ git_issue_close() {
   printf 'OK\t%s\t%s\t%s\t%s\n' "$GITHUB_OWNER/$repo" "$num" "$state" "$url"
 }
 
+# Gemeinsame Verarbeitung der Filter-Optionen --state/--label fuer
+# listen-artige Git-Befehle (issues/pulls). Setzt die Variablen
+# GIT_LIST_STATE (open|closed|all), GIT_LIST_LABEL und GIT_LIST_LABEL_ENC
+# (URL-kodierte Form des Labels, leer = keiner).
+git_list_opts() {
+  local who="$1"; shift
+  GIT_LIST_STATE="open"; GIT_LIST_LABEL=""; GIT_LIST_LABEL_ENC=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --state) [ $# -ge 2 ] || die "$who: --state braucht einen Wert"; GIT_LIST_STATE="$2"; shift 2 ;;
+    --label) [ $# -ge 2 ] || die "$who: --label braucht einen Wert"; GIT_LIST_LABEL="$2"; shift 2 ;;
+    *) die "$who: unbekannte Option '$1'" ;;
+  esac; done
+  case "$GIT_LIST_STATE" in open|closed|all) ;; *) die "$who: ungueltiger --state '$GIT_LIST_STATE' (open|closed|all)" ;; esac
+  if [ -n "$GIT_LIST_LABEL" ]; then
+    GIT_LIST_LABEL_ENC="$(jq -rn --arg l "$GIT_LIST_LABEL" '$l|@uri')" || die "$who: Label nicht kodierbar"
+  fi
+}
+
+# Haengt den labels-Filter (URL-kodiert) an einen Query-Pfad an (falls gesetzt).
+git_list_path() {
+  local path="$1"
+  if [ -n "$GIT_LIST_LABEL_ENC" ]; then
+    path="$path&labels=$GIT_LIST_LABEL_ENC"
+  fi
+  printf '%s' "$path"
+}
+
 git_issues() {
   [ $# -ge 1 ] || die "git issues: <repo> fehlt"
   local repo="$1"; shift
-  local state="open" label="" path enc
-  while [ $# -gt 0 ]; do case "$1" in
-    --state) [ $# -ge 2 ] || die "git issues: --state braucht einen Wert"; state="$2"; shift 2 ;;
-    --label) [ $# -ge 2 ] || die "git issues: --label braucht einen Wert"; label="$2"; shift 2 ;;
-    *) die "git issues: unbekannte Option '$1'" ;;
-  esac; done
+  local path
+  git_list_opts "git issues" "$@"
   git_require_repo "git issues" "$repo"
-  case "$state" in open|closed|all) ;; *) die "git issues: ungueltiger --state '$state' (open|closed|all)" ;; esac
-  path="/repos/$GITHUB_OWNER/$repo/issues?state=$state&per_page=100"
-  if [ -n "$label" ]; then
-    enc="$(jq -rn --arg l "$label" '$l|@uri')" || die "git issues: Label nicht kodierbar"
-    path="$path&labels=$enc"
-  fi
+  path="$(git_list_path "/repos/$GITHUB_OWNER/$repo/issues?state=$GIT_LIST_STATE&per_page=100")"
   gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
   printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (.[] | [.number, .state, .title, ((.labels // []) | map(.name) | join(",")), .html_url] | @tsv) else ((.message // "Fehler") | tostring) end'
 }
 
-
 git_issues_all() {
-  local state="open" label="" path enc
-  while [ $# -gt 0 ]; do case "$1" in
-    --state) [ $# -ge 2 ] || die "git issues-all: --state braucht einen Wert"; state="$2"; shift 2 ;;
-    --label) [ $# -ge 2 ] || die "git issues-all: --label braucht einen Wert"; label="$2"; shift 2 ;;
-    *) die "git issues-all: unbekannte Option '$1'" ;;
-  esac; done
-  case "$state" in open|closed|all) ;; *) die "git issues-all: ungueltiger --state '$state' (open|closed|all)" ;; esac
-  
-  path="/user/issues?state=$state&filter=all&per_page=100"
-  if [ -n "$label" ]; then
-    enc="$(jq -rn --arg l "$label" '$l|@uri')" || die "git issues-all: Label nicht kodierbar"
-    path="$path&labels=$enc"
-  fi
-  
+  local path
+  git_list_opts "git issues-all" "$@"
+  path="$(git_list_path "/user/issues?state=$GIT_LIST_STATE&filter=all&per_page=100")"
   gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
-  
   printf '%s' "$GH_BODY" | jq -r '
-    if type=="array" then 
-      .[] 
-      | select(.pull_request == null) 
+    if type=="array" then
+      .[]
+      | select(.pull_request == null)
       | [
-          (.repository.full_name // "?"), 
-          .number, 
-          .state, 
-          .title, 
-          ((.labels // []) | map(.name) | join(",")), 
+          (.repository.full_name // "?"),
+          .number,
+          .state,
+          .title,
+          ((.labels // []) | map(.name) | join(",")),
           .html_url
-        ] 
-      | @tsv 
-    else 
-      ((.message // "Fehler") | tostring) 
+        ]
+      | @tsv
+    else
+      ((.message // "Fehler") | tostring)
     end'
 }
 
+# git_pulls <repo> [--state open|closed|all] [--label <l>]
+# Listet Pull Requests eines Repos (read-only) TAB-getrennt:
+#   nummer<TAB>state<TAB>titel<TAB>labels<TAB>autor<TAB>html_url
+git_pulls() {
+  [ $# -ge 1 ] || die "git pulls: <repo> fehlt"
+  local repo="$1"; shift
+  local path
+  git_list_opts "git pulls" "$@"
+  git_require_repo "git pulls" "$repo"
+  path="$(git_list_path "/repos/$GITHUB_OWNER/$repo/pulls?state=$GIT_LIST_STATE&per_page=100")"
+  gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
+  printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (.[] | [.number, .state, .title, ((.labels // []) | map(.name) | join(",")), (.user.login // ""), .html_url] | @tsv) else ((.message // "Fehler") | tostring) end'
+}
+
+# git_pulls_all [--state open|closed|all] [--label <l>]
+# Listet Pull Requests ueber alle sichtbaren Repos (read-only) TAB-getrennt:
+#   repo<TAB>nummer<TAB>state<TAB>titel<TAB>labels<TAB>autor<TAB>html_url
+git_pulls_all() {
+  local path
+  git_list_opts "git pulls-all" "$@"
+  path="$(git_list_path "/user/issues?state=$GIT_LIST_STATE&filter=all&per_page=100")"
+  gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
+  printf '%s' "$GH_BODY" | jq -r '
+    if type=="array" then
+      .[]
+      | select(.pull_request != null)
+      | [
+          (.repository.full_name // "?"),
+          .number,
+          .state,
+          .title,
+          ((.labels // []) | map(.name) | join(",")),
+          (.user.login // ""),
+          .html_url
+        ]
+      | @tsv
+    else
+      ((.message // "Fehler") | tostring)
+    end'
+}
 
 git_cmd() {
   TOK="$(git_token)"
@@ -919,8 +966,10 @@ git_cmd() {
     issue-close) git_issue_close "$@" ;;
     issues) git_issues "$@" ;;
     issues-all) git_issues_all "$@" ;;
+    pulls) git_pulls "$@" ;;
+    pulls-all) git_pulls_all "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "git: unbekannter Unterbefehl (info|branches|commits|repos|list|create-repo|upload|read|cat|clone|pull|issue|issue-close|issues|issues-all)" ;;
+    *) die "git: unbekannter Unterbefehl (info|branches|commits|repos|list|create-repo|upload|read|cat|clone|pull|issue|issue-close|issues|issues-all|pulls|pulls-all)" ;;
   esac
 }
 
