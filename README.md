@@ -54,6 +54,9 @@ GIT (GitHub, Konto per Token)
     teamctl git list <repo> [dir]
     teamctl git create-repo <name> [--public]     # Standard: privat
     teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
+    teamctl git read <repo> <pfad> [--ref <branch>]      # Alias: git cat
+    teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
+    teamctl git pull <dir>
     teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
     teamctl git issue-close <repo> <nummer>
     teamctl git issues <repo> [--state open|closed|all] [--label <l>]
@@ -65,6 +68,14 @@ Labels, mehrere kommagetrennt. `git issue-close` schliesst ein Issue wieder
 (`state=closed`). Beide lesen Owner/API/Token aus der Konfiguration (keine Werte hier).
 `git issues-all` listet Issues ueber ALLE sichtbaren Repos in einem Aufruf
 (Standard `--state open`); Pull Requests werden uebersprungen.
+
+`git read` (Alias `git cat`) gibt den Inhalt einer Datei ueber die
+GitHub-Contents-API aus; `--ref <branch>` waehlt eine andere Revision.
+`git clone <repo> [--dir <ziel>] [--branch <b>]` klont ein Team-Repo per HTTPS
+(Standardziel: Repo-Name im aktuellen Verzeichnis) und `git pull <dir>`
+aktualisiert es (nur Fast-Forward). Das Token wird ausschliesslich intern als
+HTTP-Header uebergeben - nie in URL, Kommandozeile oder Ausgabe - und NICHT im
+geklonten Repo gespeichert; Updates laufen daher wieder ueber `teamctl git pull`.
 
 ## Konfiguration
 
