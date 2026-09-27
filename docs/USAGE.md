@@ -39,6 +39,8 @@ GIT (GitHub, Token aus der Konfiguration)
     teamctl git issue-close <repo> <nummer>
     teamctl git issues <repo> [--state open|closed|all] [--label <l>]
     teamctl git issues-all [--state open|closed|all] [--label <l>]
+    teamctl git pulls <repo> [--state open|closed|all] [--label <l>]
+    teamctl git pulls-all [--state open|closed|all] [--label <l>]
 
 ## Konventionen
 
