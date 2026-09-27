@@ -55,8 +55,8 @@ GITHUB_OWNER="${TEAMCTL_GIT_OWNER:-}"
 GITHUB_API="${TEAMCTL_GIT_API:-}"
 
 # Generische Vorgaben (Pfade/Befehle - keine Infra-Adressen).
-SSH_KEY="${TEAMCTL_SSH_KEY:-$SELF_DIR/.ssh/id_ed25519}"
-WIKI_CREDS="${TEAMCTL_WIKI_CREDS:-<credential-file>}"
+SSH_KEY="${TEAMCTL_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+WIKI_CREDS="${TEAMCTL_WIKI_CREDS:-$SELF_DIR/wiki-credentials.txt}"
 GITHUB_TOKEN_CMD="${TEAMCTL_GITHUB_TOKEN_CMD:-gh auth token}"
 WIKI_AS="${TEAMCTL_WIKI_AS:-$WIKI_EMAIL}"
 
