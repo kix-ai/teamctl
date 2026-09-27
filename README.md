@@ -71,7 +71,7 @@ betroffenen Schluessel nennt - nie den Wert, Host oder die URL.
 | `TEAMCTL_SSH_KEY` | `~/.ssh/id_ed25519` | Pfad zum privaten SSH-Key |
 | `TEAMCTL_WIKI_CREDS` | `<skriptverzeichnis>/wiki-credentials.txt` | Kontendatei auf dem Host (pipe-getrennt; `#` am Zeilenanfang = Kommentar) |
 | `TEAMCTL_WIKI_AS` | `TEAMCTL_WIKI_EMAIL` | Wiki-Konto fuer Logins |
-| `TEAMCTL_GITHUB_TOKEN_CMD` | `gh auth token` | Befehl, der den GitHub-Token auf stdout liefert |
+| `TEAMCTL_GITHUB_TOKEN_CMD` | `gh auth token` | Befehl, der den GitHub-Token auf stdout liefert (nur einfache Wortliste ohne Shell-Metazeichen, siehe Sicherheit) |
 | `TEAMCTL_RETRY_MAX` | `4` | Wiederholungen bei HTTP 429 |
 | `TEAMCTL_RETRY_BASE` | `2` | Basis-Sekunden fuer das Backoff |
 | `TEAMCTL_RETRY_CAP` | `30` | Obergrenze der Wartezeit je Versuch (Sekunden) |
@@ -133,6 +133,11 @@ die jeweiligen Unterbefehle.
 - Slugs werden auf `[A-Za-z0-9._-]` beschraenkt (kein Pfad-Traversal).
 - Endpoint-Werte (`TEAMCTL_WIKI_URL`, `TEAMCTL_GIT_API`) werden auf das Schema
   `https://` beschraenkt; Klartext-HTTP und fehlendes Schema werden abgelehnt.
+- `TEAMCTL_GITHUB_TOKEN_CMD` wird ohne Shell-Auswertung (kein `eval`) als
+  einfache Wortliste gestartet; erlaubt sind nur `A-Z a-z 0-9 _ . / -` und
+  Leerzeichen. Alle anderen Zeichen (u. a. `; & | > < $ ( )`, Backticks und
+  Zeilenumbrueche) werden abgelehnt. Die Fehlermeldung nennt nur den
+  Schluesselnamen, nie den Befehl oder den Token.
 
 ## Lizenz
 
