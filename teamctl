@@ -547,6 +547,11 @@ git_repo_ok() {
   return 0
 }
 
+# Kodiert ein Pfadsegment bzw. einen Branch-Namen fuer die GitHub-Contents-API
+# (RFC-3986, jq @uri). Gemeinsamer Helper fuer git_list/git_upload/git_read,
+# damit Pfade mit Leerzeichen, #, ?, &, % nicht falsch interpretiert werden.
+git_uri_enc() { jq -rn --arg v "$1" '$v|@uri' || die "git: Pfad nicht kodierbar"; }
+
 git_require_repo() {
   local who="$1" name="$2"
   git_repo_ok "$name" || die "$who: ungueltiger Repo-Name '$name'"
@@ -633,11 +638,14 @@ git_commits() {
 
 git_list() {
   [ $# -ge 1 ] || die "git list: <repo> fehlt"
-  local repo="$1" dir="" path
+  local repo="$1" dir="" path dir_enc
   git_require_repo "git list" "$repo"
   if [ $# -ge 2 ]; then dir="$2"; fi
   path="/repos/$GITHUB_OWNER/$repo/contents"
-  if [ -n "$dir" ]; then path="$path/$dir"; fi
+  if [ -n "$dir" ]; then
+    dir_enc="$(git_uri_enc "$dir")" || die "git list: Verzeichnis nicht kodierbar"
+    path="$path/$dir_enc"
+  fi
   gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
   printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (.[] | [.type, (.size|tostring), .path] | @tsv) else [.type, (.size|tostring), .path] | @tsv end'
 }
@@ -660,6 +668,7 @@ git_upload() {
   [ $# -ge 3 ] || die "git upload: <repo> <pfad> <lokale-datei> fehlt"
   local repo="$1" path="$2" file="$3"; shift 3
   git_require_repo "git upload" "$repo"
+  local enc; enc="$(git_uri_enc "$path")" || die "git upload: Pfad nicht kodierbar"
   local msg="teamctl: update $path" sha="" body newsha rsha rsize lsize b64
   while [ $# -gt 0 ]; do case "$1" in
     --message) [ $# -ge 2 ] || die "git upload: --message braucht einen Wert"; msg="$2"; shift 2 ;;
@@ -667,7 +676,7 @@ git_upload() {
   esac; done
   [ -f "$file" ] || die "Datei nicht gefunden: $file"
   b64="$(base64 -w0 "$file")"
-  if gh_api GET "/repos/$GITHUB_OWNER/$repo/contents/$path" "" 2>/dev/null; then
+  if gh_api GET "/repos/$GITHUB_OWNER/$repo/contents/$enc" "" 2>/dev/null; then
     sha="$(printf '%s' "$GH_BODY" | jq -r '.sha // empty')"
   fi
   if [ -n "$sha" ]; then
@@ -676,9 +685,9 @@ git_upload() {
   else
     body="$(jq -nc --arg m "$msg" --arg c "$b64" '{message:$m,content:$c}')"
   fi
-  gh_api PUT "/repos/$GITHUB_OWNER/$repo/contents/$path" "$body" || die "HTTP $GH_HTTP: $(git_err)"
+  gh_api PUT "/repos/$GITHUB_OWNER/$repo/contents/$enc" "$body" || die "HTTP $GH_HTTP: $(git_err)"
   newsha="$(printf '%s' "$GH_BODY" | jq -r '.content.sha // empty')"
-  gh_api GET "/repos/$GITHUB_OWNER/$repo/contents/$path" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
+  gh_api GET "/repos/$GITHUB_OWNER/$repo/contents/$enc" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
   rsha="$(printf '%s' "$GH_BODY" | jq -r '.sha')"
   rsize="$(printf '%s' "$GH_BODY" | jq -r '.size')"
   lsize="$(wc -c < "$file" | tr -d '[:space:]')"
@@ -702,10 +711,10 @@ git_read() {
   esac; done
   git_require_repo "git read" "$repo"
   [ -n "$path" ] || die "git read: <pfad> fehlt"
-  enc="$(jq -rn --arg p "$path" '$p|@uri')" || die "git read: Pfad nicht kodierbar"
+  enc="$(git_uri_enc "$path")" || die "git read: Pfad nicht kodierbar"
   api="/repos/$GITHUB_OWNER/$repo/contents/$enc"
   if [ -n "$ref" ]; then
-    renc="$(jq -rn --arg r "$ref" '$r|@uri')" || die "git read: Branch nicht kodierbar"
+    renc="$(git_uri_enc "$ref")" || die "git read: Branch nicht kodierbar"
     api="$api?ref=$renc"
   fi
   gh_api GET "$api" "" || die "HTTP $GH_HTTP: $(git_err)"
