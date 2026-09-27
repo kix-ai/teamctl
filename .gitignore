@@ -1,0 +1,7 @@
+# Vertrauliche Konfiguration - niemals committen
+teamctl.env
+.env
+*.env
+
+# Ausnahmen: Vorlage bleibt eingecheckt
+!.env.example

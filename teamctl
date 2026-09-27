@@ -1,0 +1,493 @@
+#!/usr/bin/env bash
+# teamctl - Gemeinsames internes CLI fuer Wiki (Docmost), Blog und Git.
+# Kurze Befehle fuer alle Agents. Gibt keine Secrets aus.
+# Doku: siehe README.md im selben Verzeichnis.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ---------------- Konfiguration ----------------
+# Infrastruktur-Werte (Host, URL, Owner, API) stehen NICHT im Skript, sondern in
+# einer vertraulichen Datei (chmod 600, nicht in Git).
+# Reihenfolge: echte Umgebungsvariable > Konfigurationsdatei > generische Vorgaben.
+
+CONFIG_FILE="${TEAMCTL_ENV_FILE:-$SELF_DIR/teamctl.env}"
+
+# Schluessel, deren Umgebungswert Vorrang vor der Datei behaelt.
+CONFIG_KEYS=(
+  TEAMCTL_INFRA_HOST TEAMCTL_WIKI_URL TEAMCTL_WIKI_EMAIL TEAMCTL_BLOG_ROOT
+  TEAMCTL_GIT_OWNER TEAMCTL_GIT_API TEAMCTL_GITHUB_TOKEN_CMD
+  TEAMCTL_SSH_KEY TEAMCTL_WIKI_CREDS TEAMCTL_WIKI_AS
+)
+
+declare -A _ENV_SAVE=()
+for _k in "${CONFIG_KEYS[@]}"; do _ENV_SAVE["$_k"]="${!_k:-}"; done
+
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+# Echte Umgebungsvariablen haben Vorrang vor der Datei.
+for _k in "${CONFIG_KEYS[@]}"; do
+  if [ -n "${_ENV_SAVE[$_k]}" ]; then export "$_k=${_ENV_SAVE[$_k]}"; fi
+done
+unset _ENV_SAVE _k
+
+# Pflichtwerte - bewusst OHNE Default im Skript (Infra ist austauschbar).
+INFRA_HOST="${TEAMCTL_INFRA_HOST:-}"
+WIKI_BASE="${TEAMCTL_WIKI_URL:-}"
+WIKI_EMAIL="${TEAMCTL_WIKI_EMAIL:-}"
+BLOG_DIR="${TEAMCTL_BLOG_ROOT:-}"
+GITHUB_OWNER="${TEAMCTL_GIT_OWNER:-}"
+GITHUB_API="${TEAMCTL_GIT_API:-}"
+
+# Generische Vorgaben (Pfade/Befehle - keine Infra-Adressen).
+SSH_KEY="${TEAMCTL_SSH_KEY:-$SELF_DIR/.ssh/id_ed25519}"
+WIKI_CREDS="${TEAMCTL_WIKI_CREDS:-<credential-file>}"
+GITHUB_TOKEN_CMD="${TEAMCTL_GITHUB_TOKEN_CMD:-gh auth token}"
+WIKI_AS="${TEAMCTL_WIKI_AS:-$WIKI_EMAIL}"
+
+config_error() {
+  printf 'teamctl: FEHLER: %s\n' "$*" >&2
+  printf 'teamctl: Konfigurationsdatei: %s\n' "$CONFIG_FILE" >&2
+  printf 'teamctl: Pflichtwerte dort setzen (Vorlage: .env.example).\n' >&2
+  exit 1
+}
+
+require_config() {
+  local missing=()
+  [ -n "$INFRA_HOST" ]   || missing+=("TEAMCTL_INFRA_HOST")
+  [ -n "$WIKI_BASE" ]    || missing+=("TEAMCTL_WIKI_URL")
+  [ -n "$WIKI_EMAIL" ]   || missing+=("TEAMCTL_WIKI_EMAIL")
+  [ -n "$BLOG_DIR" ]     || missing+=("TEAMCTL_BLOG_ROOT")
+  [ -n "$GITHUB_OWNER" ] || missing+=("TEAMCTL_GIT_OWNER")
+  [ -n "$GITHUB_API" ]   || missing+=("TEAMCTL_GIT_API")
+  if [ "${#missing[@]}" -gt 0 ]; then
+    config_error "Konfiguration unvollstaendig - fehlt: ${missing[*]}"
+  fi
+}
+
+CURL_OPTS=(-sk --max-time 60)
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15)
+
+TOK=""
+WIKI_COOKIE=""
+WIKI_HTTP=""
+WIKI_BODY=""
+GH_HTTP=""
+GH_BODY=""
+TMPFILES=()
+
+die()  { printf 'teamctl: FEHLER: %s\n' "$*" >&2; exit 1; }
+note() { printf 'teamctl: %s\n' "$*" >&2; }
+
+cleanup() {
+  [ -n "$WIKI_COOKIE" ] && rm -f "$WIKI_COOKIE"
+  if [ "${#TMPFILES[@]}" -gt 0 ]; then rm -f "${TMPFILES[@]}"; fi
+  return 0
+}
+trap cleanup EXIT
+
+mktmp() { local f; f="$(mktemp)"; TMPFILES+=("$f"); printf '%s' "$f"; }
+
+usage() {
+  cat <<'EOF'
+teamctl - gemeinsames CLI fuer Wiki, Blog und Git
+
+WIKI (Docmost)
+  teamctl wiki spaces
+  teamctl wiki pages <spaceId>
+  teamctl wiki get <pageId>
+  teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
+  teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend]
+  teamctl wiki upload <pageId> <bilddatei>
+  (optional ueberall: --as <email|name>   Standard: writer)
+
+BLOG (statische Seite auf dem Infra-Host)
+  teamctl blog list
+  teamctl blog publish --file <html> --slug <slug>
+  teamctl blog link --title <T> --slug <slug>
+
+GIT (GitHub, Konto per Token)
+  teamctl git info <repo>
+  teamctl git list <repo> [dir]
+  teamctl git create-repo <name> [--public]
+  teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
+
+Konfiguration: siehe teamctl.env im Skript-Verzeichnis (Vorlage: .env.example).
+           TEAMCTL_INFRA_HOST TEAMCTL_WIKI_URL TEAMCTL_WIKI_EMAIL TEAMCTL_BLOG_ROOT
+           TEAMCTL_GIT_OWNER TEAMCTL_GIT_API TEAMCTL_SSH_KEY TEAMCTL_WIKI_CREDS
+EOF
+}
+
+# ---------------- SSH ----------------
+ssh_ready() { [ -f "$SSH_KEY" ] || die "SSH-Key nicht gefunden: $SSH_KEY (TEAMCTL_SSH_KEY setzen)"; }
+ssh_run()  { ssh_ready; ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "$INFRA_HOST" "$@"; }
+scp_to()   { ssh_ready; scp -q -i "$SSH_KEY" "${SSH_OPTS[@]}" "$1" "$INFRA_HOST:$2"; }
+scp_from() { ssh_ready; scp -q -i "$SSH_KEY" "${SSH_OPTS[@]}" "$INFRA_HOST:$1" "$2"; }
+
+# ---------------- Wiki (Docmost) ----------------
+wiki_resolve_email() {
+  local who="$1"
+  if [[ "$who" == *@* ]]; then printf '%s' "$who"; return 0; fi
+  ssh_run "awk -F'|' -v q='$who' '\$1 ~ /^#/ {next} q ~ /@/ {if (\$3==q) {print \$3; exit} next} \$2==q {print \$3; exit} \$3==q {print \$3; exit} {n=split(\$3,a,\"@\"); if (a[1]==q) {print \$3; exit}}' '$WIKI_CREDS' 2>/dev/null"
+}
+
+wiki_login() {
+  local who="$1" email pw code
+  email="$(wiki_resolve_email "$who")"
+  [ -n "$email" ] || die "Wiki-Konto '$who' nicht in $WIKI_CREDS gefunden"
+  pw="$(ssh_run "awk -F'|' -v e='$email' '\$3==e{print \$4; exit}' '$WIKI_CREDS' 2>/dev/null")"
+  [ -n "$pw" ] || die "Kein Passwort fuer '$email' in $WIKI_CREDS gefunden"
+  WIKI_COOKIE="$(mktmp)"
+  code="$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' -X POST \
+    "$WIKI_BASE/api/auth/login" -H 'Content-Type: application/json' \
+    --data-binary "$(jq -nc --arg e "$email" --arg p "$pw" '{email:$e,password:$p}')" \
+    -c "$WIKI_COOKIE")"
+  [ "$code" = "200" ] || die "Wiki-Login '$email' fehlgeschlagen (HTTP $code)"
+}
+
+wiki_api() {
+  local ep="$1" body="$2" f
+  [ -n "$body" ] || body='{}'
+  f="$(mktmp)"
+  WIKI_HTTP="$(curl "${CURL_OPTS[@]}" -o "$f" -w '%{http_code}' -X POST "$WIKI_BASE/api/$ep" \
+    -H 'Content-Type: application/json' -b "$WIKI_COOKIE" --data-binary "$body")"
+  WIKI_BODY="$(cat "$f")"
+  case "$WIKI_HTTP" in 200|201) return 0 ;; *) return 1 ;; esac
+}
+
+wiki_err() { printf '%s' "$WIKI_BODY" | jq -r '.message // .error // empty' 2>/dev/null | head -1; }
+
+wiki_api_or_die() {
+  wiki_api "$1" "$2" || die "HTTP $WIKI_HTTP bei POST /api/$1: $(wiki_err)"
+}
+
+wiki_fetch_sidebar() {
+  local space="$1" page="$2" body
+  if [ -n "$page" ]; then
+    body="$(jq -nc --arg s "$space" --arg p "$page" '{spaceId:$s,pageId:$p}')"
+  else
+    body="$(jq -nc --arg s "$space" '{spaceId:$s}')"
+  fi
+  wiki_api "pages/sidebar-pages" "$body" || die "HTTP $WIKI_HTTP bei POST /api/pages/sidebar-pages: $(wiki_err)"
+}
+
+wiki_print_tree() {
+  local space="$1" json="$2" ind="$3" id title hc sub
+  while IFS=$'\t' read -r id title hc; do
+    [ -n "$id" ] || continue
+    printf '%s%s\t%s\n' "$ind" "$id" "$title"
+    if [ "$hc" = "true" ]; then
+      wiki_fetch_sidebar "$space" "$id"
+      sub="$(printf '%s' "$WIKI_BODY" | jq -c '.data.items')"
+      wiki_print_tree "$space" "$sub" "$ind  "
+    fi
+  done < <(printf '%s' "$json" | jq -r '.[] | [.id, .title, (.hasChildren|tostring)] | @tsv')
+}
+
+wiki_spaces() {
+  wiki_login "$WIKI_AS"
+  wiki_api_or_die "spaces/" '{}'
+  printf '%s' "$WIKI_BODY" | jq -r '.data.items[] | [.id, .slug, .name] | @tsv'
+}
+
+wiki_pages() {
+  [ $# -ge 1 ] || die "wiki pages: <spaceId> fehlt"
+  local space="$1"
+  wiki_login "$WIKI_AS"
+  wiki_fetch_sidebar "$space" ""
+  local items; items="$(printf '%s' "$WIKI_BODY" | jq -c '.data.items')"
+  wiki_print_tree "$space" "$items" ""
+}
+
+wiki_get() {
+  [ $# -ge 1 ] || die "wiki get: <pageId> fehlt"
+  local page="$1"
+  wiki_login "$WIKI_AS"
+  wiki_api_or_die "pages/info" "$(jq -nc --arg p "$page" '{pageId:$p, format:"markdown", includeContent:true}')"
+  printf '%s\n\n' "$(printf '%s' "$WIKI_BODY" | jq -r '.data.title')"
+  printf '%s\n' "$(printf '%s' "$WIKI_BODY" | jq -r '.data.content // ""')"
+}
+
+wiki_create() {
+  local space="" title="" file="" parent="" body id rt
+  while [ $# -gt 0 ]; do case "$1" in
+    --space)  [ $# -ge 2 ] || die "wiki create: --space braucht einen Wert"; space="$2"; shift 2 ;;
+    --title)  [ $# -ge 2 ] || die "wiki create: --title braucht einen Wert"; title="$2"; shift 2 ;;
+    --file)   [ $# -ge 2 ] || die "wiki create: --file braucht einen Wert"; file="$2"; shift 2 ;;
+    --parent) [ $# -ge 2 ] || die "wiki create: --parent braucht einen Wert"; parent="$2"; shift 2 ;;
+    --as)     [ $# -ge 2 ] || die "wiki create: --as braucht einen Wert"; WIKI_AS="$2"; shift 2 ;;
+    *) die "wiki create: unbekannte Option '$1'" ;;
+  esac; done
+  [ -n "$space" ] || die "wiki create: --space fehlt"
+  [ -n "$title" ] || die "wiki create: --title fehlt"
+  [ -n "$file" ] || die "wiki create: --file fehlt"
+  [ -f "$file" ] || die "Datei nicht gefunden: $file"
+  wiki_login "$WIKI_AS"
+  if [ -n "$parent" ]; then
+    body="$(jq -nc --arg s "$space" --arg t "$title" --arg p "$parent" --rawfile c "$file" '{spaceId:$s,title:$t,parentPageId:$p,content:$c,format:"markdown"}')"
+  else
+    body="$(jq -nc --arg s "$space" --arg t "$title" --rawfile c "$file" '{spaceId:$s,title:$t,content:$c,format:"markdown"}')"
+  fi
+  wiki_api_or_die "pages/create" "$body"
+  id="$(printf '%s' "$WIKI_BODY" | jq -r '.data.id // empty')"
+  [ -n "$id" ] || die "wiki create: keine Page-ID in der Antwort"
+  wiki_api_or_die "pages/info" "$(jq -nc --arg p "$id" '{pageId:$p}')"
+  rt="$(printf '%s' "$WIKI_BODY" | jq -r '.data.title // empty')"
+  [ "$rt" = "$title" ] || die "wiki create: Verifikation fehlgeschlagen (Titel '$rt' != '$title', id=$id)"
+  printf '%s\n' "$id"
+}
+
+wiki_update() {
+  [ $# -ge 1 ] || die "wiki update: <pageId> fehlt"
+  local page="$1"; shift
+  local file="" mode="replace" body content probe
+  while [ $# -gt 0 ]; do case "$1" in
+    --file) [ $# -ge 2 ] || die "wiki update: --file braucht einen Wert"; file="$2"; shift 2 ;;
+    --mode) [ $# -ge 2 ] || die "wiki update: --mode braucht einen Wert"; mode="$2"; shift 2 ;;
+    --as)   [ $# -ge 2 ] || die "wiki update: --as braucht einen Wert"; WIKI_AS="$2"; shift 2 ;;
+    *) die "wiki update: unbekannte Option '$1'" ;;
+  esac; done
+  [ -n "$file" ] || die "wiki update: --file fehlt"
+  [ -f "$file" ] || die "Datei nicht gefunden: $file"
+  case "$mode" in replace|append|prepend) ;; *) die "wiki update: ungueltiger --mode '$mode' (replace|append|prepend)" ;; esac
+  wiki_login "$WIKI_AS"
+  body="$(jq -nc --arg p "$page" --arg m "$mode" --rawfile c "$file" '{pageId:$p,content:$c,format:"markdown",operation:$m}')"
+  wiki_api_or_die "pages/update" "$body"
+  wiki_api_or_die "pages/info" "$(jq -nc --arg p "$page" '{pageId:$p, format:"markdown", includeContent:true}')"
+  content="$(printf '%s' "$WIKI_BODY" | jq -r '.data.content // ""')"
+  probe="$(grep -oE '[A-Za-z0-9]{6,}' "$file" | head -1)"
+  if [ -n "$probe" ]; then
+    printf '%s' "$content" | grep -qF "$probe" || die "wiki update: Verifikation fehlgeschlagen ('$probe' fehlt, id=$page)"
+  fi
+  printf 'OK\t%s\t%s\n' "$page" "$mode"
+}
+
+wiki_upload() {
+  [ $# -ge 2 ] || die "wiki upload: <pageId> <bilddatei> fehlt"
+  local page="$1" file="$2" f url code
+  [ -f "$file" ] || die "Datei nicht gefunden: $file"
+  wiki_login "$WIKI_AS"
+  f="$(mktmp)"
+  WIKI_HTTP="$(curl "${CURL_OPTS[@]}" -o "$f" -w '%{http_code}' -X POST "$WIKI_BASE/api/files/upload" \
+    -b "$WIKI_COOKIE" -F "pageId=$page" -F "file=@$file")"
+  WIKI_BODY="$(cat "$f")"
+  case "$WIKI_HTTP" in 200|201) ;; *) die "HTTP $WIKI_HTTP bei POST /api/files/upload: $(wiki_err)" ;; esac
+  url="$(printf '%s' "$WIKI_BODY" | jq -r '.url // .data.url // empty')"
+  [ -n "$url" ] || die "wiki upload: keine URL in der Antwort"
+  code="$(curl "${CURL_OPTS[@]}" -L -o /dev/null -w '%{http_code}' -b "$WIKI_COOKIE" "$url")"
+  [ "$code" = "200" ] || die "wiki upload: Read-back fehlgeschlagen (HTTP $code, $url)"
+  printf '%s\n' "$url"
+}
+
+wiki_cmd() {
+  local args=() sub
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as) [ $# -ge 2 ] || die "wiki: --as braucht einen Wert"; WIKI_AS="$2"; shift 2 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  if [ "${#args[@]}" -gt 0 ]; then set -- "${args[@]}"; else set --; fi
+  sub="${1:-}"; shift || true
+  case "$sub" in
+    spaces) wiki_spaces ;;
+    pages)  wiki_pages "$@" ;;
+    get)    wiki_get "$@" ;;
+    create) wiki_create "$@" ;;
+    update) wiki_update "$@" ;;
+    upload) wiki_upload "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "wiki: unbekannter Unterbefehl (spaces|pages|get|create|update|upload)" ;;
+  esac
+}
+
+# ---------------- Blog ----------------
+BLOG_SLUG_RE='^[A-Za-z0-9._-]+$'
+
+blog_list() {
+  ssh_run "ls -1 -- '$BLOG_DIR/posts' 2>/dev/null | sed 's/[.]html$//'" || die "blog: Posts nicht lesbar ($BLOG_DIR/posts)"
+}
+
+blog_publish() {
+  local file="" slug="" tmp out remote_size local_size
+  while [ $# -gt 0 ]; do case "$1" in
+    --file) [ $# -ge 2 ] || die "blog publish: --file braucht einen Wert"; file="$2"; shift 2 ;;
+    --slug) [ $# -ge 2 ] || die "blog publish: --slug braucht einen Wert"; slug="$2"; shift 2 ;;
+    *) die "blog publish: unbekannte Option '$1'" ;;
+  esac; done
+  [ -n "$file" ] || die "blog publish: --file fehlt"
+  [ -n "$slug" ] || die "blog publish: --slug fehlt"
+  [ -f "$file" ] || die "Datei nicht gefunden: $file"
+  [[ "$slug" =~ $BLOG_SLUG_RE ]] || die "blog publish: ungueltiger Slug '$slug'"
+  tmp="/tmp/teamctl_blog_$$.html"
+  scp_to "$file" "$tmp" || die "blog publish: scp fehlgeschlagen"
+  out="$(ssh_run "install -m 644 '$tmp' '$BLOG_DIR/posts/$slug.html' && rm -f '$tmp' && wc -c < '$BLOG_DIR/posts/$slug.html'")" || die "blog publish: Deployment fehlgeschlagen"
+  remote_size="$(printf '%s' "$out" | tr -d '[:space:]')"
+  local_size="$(wc -c < "$file" | tr -d '[:space:]')"
+  [ "$remote_size" = "$local_size" ] || die "blog publish: Verifikation fehlgeschlagen (remote=$remote_size lokal=$local_size)"
+  printf 'OK\t/posts/%s.html\t%s\n' "$slug" "$remote_size"
+}
+
+blog_link() {
+  local title="" slug="" tmp before=0 after=0 remote_tmp
+  while [ $# -gt 0 ]; do case "$1" in
+    --title) [ $# -ge 2 ] || die "blog link: --title braucht einen Wert"; title="$2"; shift 2 ;;
+    --slug)  [ $# -ge 2 ] || die "blog link: --slug braucht einen Wert"; slug="$2"; shift 2 ;;
+    *) die "blog link: unbekannte Option '$1'" ;;
+  esac; done
+  [ -n "$title" ] || die "blog link: --title fehlt"
+  [ -n "$slug" ] || die "blog link: --slug fehlt"
+  [[ "$slug" =~ $BLOG_SLUG_RE ]] || die "blog link: ungueltiger Slug '$slug'"
+  tmp="$(mktmp)"
+  scp_from "$BLOG_DIR/index.html" "$tmp" || die "blog link: index.html nicht lesbar"
+  if grep -qF "href=\"/posts/$slug.html\"" "$tmp"; then
+    note "Link fuer '$slug' existiert bereits - keine Aenderung"
+    printf 'SKIP\t%s\n' "$slug"
+    return 0
+  fi
+  before="$(grep -c 'href="/posts/' "$tmp" || true)"
+  python3 - "$tmp" "$slug" "$title" <<'PY' || die "blog link: index.html Bearbeitung fehlgeschlagen"
+import sys, io, html
+path, slug, title = sys.argv[1], sys.argv[2], sys.argv[3]
+doc = io.open(path, encoding='utf-8').read()
+item = '    <li><a href="/posts/%s.html">%s</a></li>\n' % (slug, html.escape(title))
+i = doc.rfind('</ul>')
+if i == -1:
+    sys.stderr.write('kein </ul> in index.html gefunden\n'); sys.exit(1)
+io.open(path, 'w', encoding='utf-8').write(doc[:i] + item + doc[i:])
+PY
+  remote_tmp="/tmp/teamctl_index_$$.html"
+  scp_to "$tmp" "$remote_tmp" || die "blog link: scp fehlgeschlagen"
+  ssh_run "install -m 644 '$remote_tmp' '$BLOG_DIR/index.html' && rm -f '$remote_tmp'" || die "blog link: Deployment fehlgeschlagen"
+  after="$(ssh_run "grep -c 'href=\"/posts/' '$BLOG_DIR/index.html'" || true)"
+  [ "$after" -eq "$((before + 1))" ] || die "blog link: Verifikation fehlgeschlagen (vorher=$before nachher=$after)"
+  ssh_run "grep -q 'href=\"/posts/$slug.html\"' '$BLOG_DIR/index.html'" || die "blog link: Slug nicht in index.html gefunden"
+  printf 'OK\t%s\tlinks=%s\n' "$slug" "$after"
+}
+
+blog_cmd() {
+  local sub; sub="${1:-}"; shift || true
+  case "$sub" in
+    list) blog_list ;;
+    publish) blog_publish "$@" ;;
+    link) blog_link "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "blog: unbekannter Unterbefehl (list|publish|link)" ;;
+  esac
+}
+
+# ---------------- Git (GitHub) ----------------
+git_token() {
+  local t
+  t="$(eval "$GITHUB_TOKEN_CMD" 2>/dev/null)" || die "git: Token nicht lesbar ($GITHUB_TOKEN_CMD)"
+  [ -n "$t" ] || die "git: Token leer"
+  printf '%s' "$t"
+}
+
+gh_api() {
+  local method="$1" path="$2" data="$3" f
+  f="$(mktmp)"
+  local args=(-sS --max-time 60 -X "$method" \
+    -H "Authorization: Bearer $TOK" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    -H "User-Agent: teamctl")
+  if [ -n "$data" ]; then args+=(--data-binary "$data"); fi
+  GH_HTTP="$(curl "${args[@]}" -o "$f" -w '%{http_code}' "$GITHUB_API$path")"
+  GH_BODY="$(cat "$f")"
+  case "$GH_HTTP" in 200|201) return 0 ;; *) return 1 ;; esac
+}
+
+git_err() { printf '%s' "$GH_BODY" | jq -r '.message // empty' 2>/dev/null | head -1; }
+
+git_info() {
+  [ $# -ge 1 ] || die "git info: <repo> fehlt"
+  local repo="$1"
+  gh_api GET "/repos/$GITHUB_OWNER/$repo" "" || die "HTTP $GH_HTTP: $(git_err)"
+  printf '%s' "$GH_BODY" | jq -r '"full_name\t\(.full_name)", "private\t\(.private)", "default_branch\t\(.default_branch)", "description\t\(.description // "")", "html_url\t\(.html_url)", "size_kb\t\(.size)"'
+}
+
+git_list() {
+  [ $# -ge 1 ] || die "git list: <repo> fehlt"
+  local repo="$1" dir="" path
+  if [ $# -ge 2 ]; then dir="$2"; fi
+  path="/repos/$GITHUB_OWNER/$repo/contents"
+  if [ -n "$dir" ]; then path="$path/$dir"; fi
+  gh_api GET "$path" "" || die "HTTP $GH_HTTP: $(git_err)"
+  printf '%s' "$GH_BODY" | jq -r 'if type=="array" then (.[] | [.type, (.size|tostring), .path] | @tsv) else [.type, (.size|tostring), .path] | @tsv end'
+}
+
+git_create_repo() {
+  local name="" public=false body
+  while [ $# -gt 0 ]; do case "$1" in
+    --public)  public=true; shift ;;
+    --private) public=false; shift ;;
+    -*) die "git create-repo: unbekannte Option '$1'" ;;
+    *) name="$1"; shift ;;
+  esac; done
+  [ -n "$name" ] || die "git create-repo: <name> fehlt"
+  body="$(jq -nc --arg n "$name" --argjson p "$public" '{name:$n, private:($p|not), auto_init:true}')"
+  gh_api POST "/user/repos" "$body" || die "HTTP $GH_HTTP: $(git_err)"
+  printf '%s' "$GH_BODY" | jq -r '[.full_name, ("private=" + (.private|tostring)), .html_url] | @tsv'
+}
+
+git_upload() {
+  [ $# -ge 3 ] || die "git upload: <repo> <pfad> <lokale-datei> fehlt"
+  local repo="$1" path="$2" file="$3"; shift 3
+  local msg="teamctl: update $path" sha="" body newsha rsha rsize lsize b64
+  while [ $# -gt 0 ]; do case "$1" in
+    --message) [ $# -ge 2 ] || die "git upload: --message braucht einen Wert"; msg="$2"; shift 2 ;;
+    *) die "git upload: unbekannte Option '$1'" ;;
+  esac; done
+  [ -f "$file" ] || die "Datei nicht gefunden: $file"
+  b64="$(base64 -w0 "$file")"
+  if gh_api GET "/repos/$GITHUB_OWNER/$repo/contents/$path" "" 2>/dev/null; then
+    sha="$(printf '%s' "$GH_BODY" | jq -r '.sha // empty')"
+  fi
+  if [ -n "$sha" ]; then
+    body="$(jq -nc --arg m "$msg" --arg c "$b64" --arg s "$sha" '{message:$m,content:$c,sha:$s}')"
+    note "Datei existiert bereits - wird aktualisiert"
+  else
+    body="$(jq -nc --arg m "$msg" --arg c "$b64" '{message:$m,content:$c}')"
+  fi
+  gh_api PUT "/repos/$GITHUB_OWNER/$repo/contents/$path" "$body" || die "HTTP $GH_HTTP: $(git_err)"
+  newsha="$(printf '%s' "$GH_BODY" | jq -r '.content.sha // empty')"
+  gh_api GET "/repos/$GITHUB_OWNER/$repo/contents/$path" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
+  rsha="$(printf '%s' "$GH_BODY" | jq -r '.sha')"
+  rsize="$(printf '%s' "$GH_BODY" | jq -r '.size')"
+  lsize="$(wc -c < "$file" | tr -d '[:space:]')"
+  [ "$rsize" = "$lsize" ] || die "git upload: Verifikation fehlgeschlagen (remote=$rsize lokal=$lsize)"
+  if [ -n "$newsha" ]; then
+    [ "$rsha" = "$newsha" ] || die "git upload: Verifikation fehlgeschlagen (sha remote=$rsha neu=$newsha)"
+  fi
+  printf 'OK\t%s/%s\t%s\t%s\n' "$GITHUB_OWNER" "$repo" "$path" "$rsha"
+}
+
+git_cmd() {
+  TOK="$(git_token)"
+  local sub; sub="${1:-}"; shift || true
+  case "$sub" in
+    info) git_info "$@" ;;
+    list) git_list "$@" ;;
+    create-repo) git_create_repo "$@" ;;
+    upload) git_upload "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "git: unbekannter Unterbefehl (info|list|create-repo|upload)" ;;
+  esac
+}
+
+# ---------------- Dispatch ----------------
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  ""|-h|--help|help) usage; exit 0 ;;
+esac
+require_config
+case "$cmd" in
+  wiki) wiki_cmd "$@" ;;
+  blog) blog_cmd "$@" ;;
+  git)  git_cmd "$@" ;;
+  *) die "unbekannter Befehl '$cmd' (wiki|blog|git|help)" ;;
+esac
