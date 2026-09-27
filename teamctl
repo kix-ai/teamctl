@@ -159,6 +159,8 @@ WIKI (Docmost)
   teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
   teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend]
   teamctl wiki upload <pageId> <bilddatei>
+  teamctl wiki me
+  teamctl wiki profile --name <name>
   (optional ueberall: --as <email|name>   Standard: writer)
 
 BLOG (statische Seite auf dem Infra-Host)
@@ -347,6 +349,44 @@ wiki_upload() {
   printf '%s\n' "$url"
 }
 
+wiki_me() {
+  wiki_login "$WIKI_AS"
+  local f
+  f="$(mktmp)"
+  WIKI_HTTP="$(wiki_http "$f" -X POST "$WIKI_BASE/api/users/me" -H 'Content-Type: application/json' --data-binary '{}' -b "$WIKI_COOKIE")"
+  WIKI_BODY="$(cat "$f")"
+  local name
+  name="$(printf '%s' "$WIKI_BODY" | jq -r '.data.user.name // empty')"
+  printf '%s\n' "$name"
+}
+
+wiki_profile() {
+  [ $# -ge 1 ] || die "wiki profile: --name <name> fehlt"
+  local name=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --name) [ $# -ge 2 ] || die "wiki profile: --name braucht einen Wert"; name="$2"; shift 2 ;;
+    *) die "wiki profile: unbekannte Option '$1'" ;;
+  esac; done
+  [ -n "$name" ] || die "wiki profile: --name fehlt"
+
+  wiki_login "$WIKI_AS"
+
+  # Set new name
+  local body
+  body=$(jq -nc --arg n "$name" '{name:$n}')
+  wiki_api "users/update" "$body" || die "HTTP $WIKI_HTTP bei POST /api/users/update: $(wiki_err)"
+
+  # Read back
+  local f
+  f="$(mktmp)"
+  WIKI_HTTP="$(wiki_http "$f" -X POST "$WIKI_BASE/api/users/me" -H 'Content-Type: application/json' --data-binary '{}' -b "$WIKI_COOKIE")"
+  WIKI_BODY="$(cat "$f")"
+
+  local new_name
+  new_name="$(printf '%s' "$WIKI_BODY" | jq -r '.data.user.name // empty')"
+  printf 'OK\tName aktualisiert auf: %s\n' "$new_name"
+}
+
 wiki_cmd() {
   local args=() sub
   while [ $# -gt 0 ]; do
@@ -364,6 +404,8 @@ wiki_cmd() {
     create) wiki_create "$@" ;;
     update) wiki_update "$@" ;;
     upload) wiki_upload "$@" ;;
+    me) wiki_me "$@" ;;
+    profile) wiki_profile "$@" ;;
     ""|-h|--help|help) usage ;;
     *) die "wiki: unbekannter Unterbefehl (spaces|pages|get|create|update|upload)" ;;
   esac
