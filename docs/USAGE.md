@@ -25,6 +25,7 @@ GIT (GitHub; Standard privat)
     teamctl git list <repo> [dir]
     teamctl git create-repo <name> [--public]
     teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
+    teamctl git issues <repo> [--state open|closed|all] [--label <l>]
 
 ## Konventionen
 
