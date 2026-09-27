@@ -608,8 +608,19 @@ git_owner_repo() {
 }
 
 git_token() {
+  # Injektionssicher: kein eval, keine Shell-Expansion. Der Befehl wird als
+  # einfache Wortliste (word splitting) ausgefuehrt. Erlaubt sind nur
+  # harmlose Zeichen; Metazeichen werden abgelehnt (Meldung nennt nur den
+  # Schluesselnamen, nie den Wert).
+  local -a cmd
+  case "$GITHUB_TOKEN_CMD" in
+    *[!A-Za-z0-9_./\ -]*)
+      die "git: TEAMCTL_GITHUB_TOKEN_CMD enthaelt unerlaubte Zeichen (erlaubt: A-Z a-z 0-9 _ . / - und Leerzeichen)" ;;
+  esac
+  IFS=' ' read -r -a cmd <<< "$GITHUB_TOKEN_CMD"
+  [ "${#cmd[@]}" -gt 0 ] || die "git: TEAMCTL_GITHUB_TOKEN_CMD ist leer"
   local t
-  t="$(eval "$GITHUB_TOKEN_CMD" 2>/dev/null)" || die "git: Token nicht lesbar ($GITHUB_TOKEN_CMD)"
+  t="$("${cmd[@]}" 2>/dev/null)" || die "git: Token nicht lesbar (TEAMCTL_GITHUB_TOKEN_CMD)"
   [ -n "$t" ] || die "git: Token leer"
   printf '%s' "$t"
 }
