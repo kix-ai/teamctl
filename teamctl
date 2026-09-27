@@ -174,6 +174,10 @@ GIT (GitHub, Konto per Token)
   teamctl git list <repo> [dir]
   teamctl git create-repo <name> [--public]
   teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
+  teamctl git read <repo> <pfad> [--ref <branch>]
+  teamctl git cat <repo> <pfad>          (Alias fuer read)
+  teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
+  teamctl git pull <dir>
   teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
   teamctl git issue-close <repo> <nummer>
   teamctl git issues <repo> [--state open|closed|all] [--label <l>]
@@ -616,6 +620,99 @@ git_upload() {
   printf 'OK\t%s/%s\t%s\t%s\n' "$GITHUB_OWNER" "$repo" "$path" "$rsha"
 }
 
+# git_read <repo> <pfad> [--ref <branch>]   (Alias: git cat)
+# Liest eine Textdatei ueber die GitHub-Contents-API. Der Aufrufer braucht weder
+# Token noch URL; das Token bleibt intern und wird nie ausgegeben.
+git_read() {
+  [ $# -ge 2 ] || die "git read: <repo> <pfad> fehlt"
+  local repo="$1" path="$2"; shift 2
+  local ref="" enc renc api type size content
+  while [ $# -gt 0 ]; do case "$1" in
+    --ref) [ $# -ge 2 ] || die "git read: --ref braucht einen Wert"; ref="$2"; shift 2 ;;
+    *) die "git read: unbekannte Option '$1'" ;;
+  esac; done
+  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git read: ungueltiger Repo-Name '$repo'"
+  [ -n "$path" ] || die "git read: <pfad> fehlt"
+  enc="$(jq -rn --arg p "$path" '$p|@uri')" || die "git read: Pfad nicht kodierbar"
+  api="/repos/$GITHUB_OWNER/$repo/contents/$enc"
+  if [ -n "$ref" ]; then
+    renc="$(jq -rn --arg r "$ref" '$r|@uri')" || die "git read: Branch nicht kodierbar"
+    api="$api?ref=$renc"
+  fi
+  gh_api GET "$api" "" || die "HTTP $GH_HTTP: $(git_err)"
+  type="$(printf '%s' "$GH_BODY" | jq -r 'if type=="object" then (.type // "") else "array" end')"
+  [ "$type" = "file" ] || die "git read: '$path' ist in $repo keine regulaere Datei (type='${type:-?}')"
+  size="$(printf '%s' "$GH_BODY" | jq -r '.size // 0')"
+  if [ "${size:-0}" -gt 1000000 ] 2>/dev/null; then
+    die "git read: Datei zu gross fuer die Contents-API (${size} Bytes) - stattdessen 'teamctl git clone' nutzen"
+  fi
+  content="$(printf '%s' "$GH_BODY" | jq -r '.content // "" | gsub("[\\r\\n]"; "") | @base64d')" \
+    || die "git read: Inhalt nicht dekodierbar (binaere Datei?)"
+  printf '%s\n' "$content"
+}
+
+# git_clone <repo> [--dir <ziel>] [--branch <b>]
+# Klont ein Team-Repo per HTTPS. Das Token wird ausschliesslich intern als
+# HTTP-Header uebergeben (nicht in URL, Kommandozeile oder Ausgabe) und NICHT
+# im geklonten Repo gespeichert.
+git_clone() {
+  [ $# -ge 1 ] || die "git clone: <repo> fehlt"
+  local repo="" dir="" branch=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --dir) [ $# -ge 2 ] || die "git clone: --dir braucht einen Wert"; dir="$2"; shift 2 ;;
+    --branch) [ $# -ge 2 ] || die "git clone: --branch braucht einen Wert"; branch="$2"; shift 2 ;;
+    -*) die "git clone: unbekannte Option '$1'" ;;
+    *) if [ -z "$repo" ]; then repo="$1";
+       elif [ -z "$dir" ]; then dir="$1";
+       else die "git clone: zu viele Argumente ('$1')"; fi
+       shift ;;
+  esac; done
+  [[ "$repo" =~ $GIT_REPO_RE ]] || die "git clone: ungueltiger Repo-Name '$repo'"
+  [ -n "$dir" ] || dir="$repo"
+  [ -e "$dir" ] && die "git clone: Ziel existiert bereits: $dir"
+  local url="https://github.com/$GITHUB_OWNER/$repo.git" hdr ef sha br n
+  local args=(--quiet)
+  [ -n "$branch" ] && args+=(--branch "$branch")
+  hdr="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOK" | base64 -w0)"
+  ef="$(mktmp)"
+  if ! GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 \
+       GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="$hdr" \
+       git clone "${args[@]}" "$url" "$dir" >/dev/null 2>"$ef"; then
+    sed -n '1,5p' "$ef" >&2
+    die "git clone $GITHUB_OWNER/$repo fehlgeschlagen (Ziel: $dir)"
+  fi
+  sha="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)"
+  br="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  n="$(git -C "$dir" ls-files 2>/dev/null | wc -l | tr -d '[:space:]')"
+  note "geklont: $GITHUB_OWNER/$repo -> $dir"
+  printf 'OK\t%s/%s\t%s\t%s\t%s\t%s\n' "$GITHUB_OWNER" "$repo" "$dir" "$br" "$sha" "$n"
+}
+
+# git_pull <dir>
+# Aktualisiert ein zuvor geklontes Repo (nur fast-forward). Token wie bei clone
+# ausschliesslich intern; im Repo selbst werden keine Credentials abgelegt.
+git_pull() {
+  [ $# -ge 1 ] || die "git pull: <dir> fehlt"
+  local dir="$1" old new br hdr ef
+  [ -d "$dir/.git" ] || die "git pull: kein Git-Repository: $dir"
+  old="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)"
+  br="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  hdr="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOK" | base64 -w0)"
+  ef="$(mktmp)"
+  if ! GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 \
+       GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="$hdr" \
+       git -C "$dir" pull --ff-only --quiet >/dev/null 2>"$ef"; then
+    sed -n '1,5p' "$ef" >&2
+    die "git pull fehlgeschlagen in $dir"
+  fi
+  new="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)"
+  if [ "$old" = "$new" ]; then
+    printf 'OK\t%s\t%s\t%s\tunveraendert\n' "$dir" "$br" "$new"
+  else
+    printf 'OK\t%s\t%s\t%s..%s\taktualisiert\n' "$dir" "$br" "$old" "$new"
+  fi
+}
+
 git_issue() {
   [ $# -ge 1 ] || die "git issue: <repo> fehlt"
   local repo="$1"; shift
@@ -733,12 +830,16 @@ git_cmd() {
     list) git_list "$@" ;;
     create-repo) git_create_repo "$@" ;;
     upload) git_upload "$@" ;;
+    read) git_read "$@" ;;
+    cat) git_read "$@" ;;
+    clone) git_clone "$@" ;;
+    pull) git_pull "$@" ;;
     issue) git_issue "$@" ;;
     issue-close) git_issue_close "$@" ;;
     issues) git_issues "$@" ;;
     issues-all) git_issues_all "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "git: unbekannter Unterbefehl (info|list|create-repo|upload|issue|issue-close|issues-all)" ;;
+    *) die "git: unbekannter Unterbefehl (info|list|create-repo|upload|read|cat|clone|pull|issue|issue-close|issues|issues-all)" ;;
   esac
 }
 
