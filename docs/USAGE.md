@@ -35,8 +35,8 @@ GIT (GitHub, Token aus der Konfiguration)
     teamctl git read <repo> <pfad> [--ref <branch>]      (Alias: git cat)
     teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
     teamctl git pull <dir>
-    teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
-    teamctl git issue-close <repo> <nummer>
+    teamctl git issue <repo|owner/repo> --title <T> (--body <B> | --file <md>) [--label <l>]
+    teamctl git issue-close <repo|owner/repo> <nummer>
     teamctl git issues <repo> [--state open|closed|all] [--label <l>]
     teamctl git issues-all [--state open|closed|all] [--label <l>]
     teamctl git pulls <repo> [--state open|closed|all] [--label <l>]

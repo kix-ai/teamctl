@@ -181,8 +181,8 @@ GIT (GitHub, Konto per Token)
   teamctl git cat <repo> <pfad>          (Alias fuer read)
   teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
   teamctl git pull <dir>
-  teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
-  teamctl git issue-close <repo> <nummer>
+  teamctl git issue <repo|owner/repo> --title <T> (--body <B> | --file <md>) [--label <l>]
+  teamctl git issue-close <repo|owner/repo> <nummer>
   teamctl git issues <repo> [--state open|closed|all] [--label <l>]
   teamctl git issues-all [--state open|closed|all] [--label <l>]
   teamctl git pulls <repo> [--state open|closed|all] [--label <l>]
@@ -570,6 +570,28 @@ git_require_repo() {
   git_repo_ok "$name" || die "$who: ungueltiger Repo-Name '$name'"
 }
 
+# Loest ein Repo-Argument in Owner und Repo auf und validiert beide Teile.
+# Erlaubt "<repo>" (Owner = $GITHUB_OWNER, bisheriges Verhalten) und
+# "<owner>/<repo>" fuer ein fremdes Repo. Setzt die globalen Variablen
+# GIT_OWNER und GIT_REPO. Bei "owner/repo" werden BEIDE Teile mit git_repo_ok
+# geprueft (lehnt leere Teile, ".", "..", zusaetzliche Slashes und Sonderzeichen
+# ab, damit keine Pfad-Traversal-API-Pfade entstehen).
+git_owner_repo() {
+  local who="$1" arg="$2"
+  case "$arg" in
+    */*)
+      local owner="${arg%%/*}" repo="${arg#*/}"
+      git_repo_ok "$owner" || die "$who: ungueltiger Owner-Name '$owner'"
+      git_repo_ok "$repo"  || die "$who: ungueltiger Repo-Name '$repo'"
+      GIT_OWNER="$owner"; GIT_REPO="$repo"
+      ;;
+    *)
+      git_require_repo "$who" "$arg"
+      GIT_OWNER="$GITHUB_OWNER"; GIT_REPO="$arg"
+      ;;
+  esac
+}
+
 git_token() {
   local t
   t="$(eval "$GITHUB_TOKEN_CMD" 2>/dev/null)" || die "git: Token nicht lesbar ($GITHUB_TOKEN_CMD)"
@@ -818,7 +840,7 @@ git_issue() {
     --label) [ $# -ge 2 ] || die "git issue: --label braucht einen Wert"; label="$2"; shift 2 ;;
     *) die "git issue: unbekannte Option '$1'" ;;
   esac; done
-  git_require_repo "git issue" "$repo"
+  git_owner_repo "git issue" "$repo"
   [ -n "$title" ] || die "git issue: --title fehlt"
   if [ -n "$file" ] && [ -n "$body" ]; then die "git issue: --body und --file nicht gleichzeitig"; fi
   if [ -n "$file" ]; then
@@ -831,32 +853,32 @@ git_issue() {
   else
     payload="$(jq -nc --arg t "$title" --arg b "$body" '{title:$t, body:$b}')"
   fi
-  gh_api POST "/repos/$GITHUB_OWNER/$repo/issues" "$payload" || die "HTTP $GH_HTTP: $(git_err)"
+  gh_api POST "/repos/$GIT_OWNER/$GIT_REPO/issues" "$payload" || die "HTTP $GH_HTTP: $(git_err)"
   note "POST issues: HTTP $GH_HTTP"
   num="$(printf '%s' "$GH_BODY" | jq -r '.number // empty')"
   url="$(printf '%s' "$GH_BODY" | jq -r '.html_url // empty')"
   [ -n "$num" ] || die "git issue: keine Issue-Nummer in der Antwort"
-  gh_api GET "/repos/$GITHUB_OWNER/$repo/issues/$num" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
+  gh_api GET "/repos/$GIT_OWNER/$GIT_REPO/issues/$num" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
   note "GET issue: HTTP $GH_HTTP"
   state="$(printf '%s' "$GH_BODY" | jq -r '.state // empty')"
   [ -n "$state" ] || die "git issue: Read-back ohne state"
-  printf 'OK\t%s\t%s\t%s\t%s\n' "$GITHUB_OWNER/$repo" "$num" "$state" "$url"
+  printf 'OK\t%s\t%s\t%s\t%s\n' "$GIT_OWNER/$GIT_REPO" "$num" "$state" "$url"
 }
 
 git_issue_close() {
   [ $# -ge 2 ] || die "git issue-close: <repo> <nummer> fehlt"
   local repo="$1" num="$2" payload state url
-  git_require_repo "git issue-close" "$repo"
+  git_owner_repo "git issue-close" "$repo"
   [[ "$num" =~ ^[0-9]+$ ]] || die "git issue-close: ungueltige Nummer '$num'"
   payload='{"state":"closed"}'
-  gh_api PATCH "/repos/$GITHUB_OWNER/$repo/issues/$num" "$payload" || die "HTTP $GH_HTTP: $(git_err)"
+  gh_api PATCH "/repos/$GIT_OWNER/$GIT_REPO/issues/$num" "$payload" || die "HTTP $GH_HTTP: $(git_err)"
   note "PATCH issue: HTTP $GH_HTTP"
-  gh_api GET "/repos/$GITHUB_OWNER/$repo/issues/$num" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
+  gh_api GET "/repos/$GIT_OWNER/$GIT_REPO/issues/$num" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
   note "GET issue: HTTP $GH_HTTP"
   state="$(printf '%s' "$GH_BODY" | jq -r '.state // empty')"
   url="$(printf '%s' "$GH_BODY" | jq -r '.html_url // empty')"
   [ "$state" = "closed" ] || die "git issue-close: Verifikation fehlgeschlagen (state='$state')"
-  printf 'OK\t%s\t%s\t%s\t%s\n' "$GITHUB_OWNER/$repo" "$num" "$state" "$url"
+  printf 'OK\t%s\t%s\t%s\t%s\n' "$GIT_OWNER/$GIT_REPO" "$num" "$state" "$url"
 }
 
 # Gemeinsame Verarbeitung der Filter-Optionen --state/--label fuer

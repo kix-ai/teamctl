@@ -102,12 +102,16 @@ GIT (GitHub, Konto per Token)
     teamctl git read <repo> <pfad> [--ref <branch>]      (Alias: git cat)
     teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
     teamctl git pull <dir>
-    teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
-    teamctl git issue-close <repo> <nummer>
+    teamctl git issue <repo|owner/repo> --title <T> (--body <B> | --file <md>) [--label <l>]
+    teamctl git issue-close <repo|owner/repo> <nummer>
     teamctl git issues <repo> [--state open|closed|all] [--label <l>]
     teamctl git issues-all [--state open|closed|all] [--label <l>]
     teamctl git pulls <repo> [--state open|closed|all] [--label <l>]
     teamctl git pulls-all [--state open|closed|all] [--label <l>]
+
+`git issue` und `git issue-close` akzeptieren als erstes Argument entweder nur
+`<repo>` (Owner aus `TEAMCTL_GIT_OWNER`) oder `owner/repo`, um ein Issue in
+einem fremden Repo anzulegen bzw. zu schliessen.
 
 `teamctl help` zeigt die Kurzuebersicht, `teamctl wiki|blog|git --help`
 die jeweiligen Unterbefehle.
