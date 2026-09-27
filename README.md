@@ -52,6 +52,7 @@ BLOG (statische Seite auf dem Infra-Host)
 GIT (GitHub, Konto per Token)
     teamctl git info <repo>
     teamctl git branches <repo>                    # Branches: name, sha(kurz), protected (TAB, sortiert)
+    teamctl git commits <repo> [--n <anzahl>]      # letzte Commits: sha(kurz), ISO-Datum, Author, Betreff (TAB)
     teamctl git repos                              # alle Repos des Kontos (TAB)
     teamctl git list <repo> [dir]
     teamctl git create-repo <name> [--public]     # Standard: privat
@@ -72,6 +73,13 @@ Labels, mehrere kommagetrennt. `git issue-close` schliesst ein Issue wieder
 (Standard `--state open`); Pull Requests werden uebersprungen.
 `git repos` listet alle Repositories des Kontos TAB-getrennt (Name, Sichtbarkeit,
 Default-Branch, pushed_at, html_url), sortiert nach Name. Read-only.
+
+`git commits <repo> [--n <anzahl>]` listet die letzten Commits eines Repos
+(read-only) TAB-getrennt, eine Zeile je Commit:
+`sha(kurz, 7)<TAB>ISO-Datum<TAB>author-login<TAB>erste Zeile der Nachricht`.
+`--n` ist die Anzahl (Default 10, erlaubt 1..100). Beispiel:
+`teamctl git commits teamctl --n 3`. Alle `git`-Unterbefehle pruefen den
+Repo-Namen (erlaubte Zeichen, keine `.`/`..`).
 
 `git read` (Alias `git cat`) gibt den Inhalt einer Datei ueber die
 GitHub-Contents-API aus; `--ref <branch>` waehlt eine andere Revision.
