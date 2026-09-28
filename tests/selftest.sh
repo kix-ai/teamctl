@@ -323,6 +323,20 @@ else
   ra_out="$(retry_after_secs "$H_CAP")"
   if [ "$ra_out" = "4" ]; then pass "Retry-Parser (Issue #16): Headerwert 999s auf TEAMCTL_RETRY_CAP=4 begrenzt"
   else fail "Retry-Parser (Issue #16): Begrenzung -> '$ra_out' (erwartet 4)"; fi
+
+  # Issue #17: Headerwert oberhalb der bash-Ganzzahlgrenze. Frueher scheiterte
+  # der bash-Vergleich "[ $secs -gt $cap ]" still (Fliesskommaform), der
+  # Riesenwert lief ungekappt durch. Die Kappung muss in awk erfolgen und einen
+  # reinen Integer liefern.
+  H_BIG="$WORK/hdr-big"; printf 'retry-after-auth: 99999999999999999999\n' > "$H_BIG"
+  TEAMCTL_RETRY_CAP=30
+  ra_out="$(retry_after_secs "$H_BIG")"
+  if [ "$ra_out" = "30" ]; then pass "Retry-Parser (Issue #17): intmax-Ueberlauf auf TEAMCTL_RETRY_CAP=30 gekappt"
+  else fail "Retry-Parser (Issue #17): intmax-Ueberlauf -> '$ra_out' (erwartet 30)"; fi
+  case "$ra_out" in
+    ''|*[!0-9]*) fail "Retry-Parser (Issue #17): Ausgabe kein reiner Integer ('$ra_out')" ;;
+    *)           pass "Retry-Parser (Issue #17): Ausgabe ist reiner Integer (kein 1e+20)" ;;
+  esac
   TEAMCTL_RETRY_CAP=30
 fi
 

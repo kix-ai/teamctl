@@ -199,19 +199,24 @@ retry_delay() {
 # wird auf TEAMCTL_RETRY_CAP begrenzt, damit ein unbrauchbarer Headerwert
 # (z. B. ein HTTP-Datum) die Wartezeit nicht sprengt.
 retry_after_secs() {
-  local hdr="$1" secs
-  secs="$(awk '
+  local hdr="$1"
+  # Die Begrenzung auf TEAMCTL_RETRY_CAP passiert IN awk: Headerwerte oberhalb
+  # der bash-Ganzzahlgrenze (z. B. 99999999999999999999) liefern eine
+  # Fliesskommaform, bei der der bash-Vergleich "[ $secs -gt $cap ]" still
+  # scheitert und nicht kappt. awk vergleicht exakt und gibt per "%d" einen
+  # reinen Integer aus (kein 1e+20).
+  awk -v cap="$TEAMCTL_RETRY_CAP" '
     BEGIN { m = 0 }
     { h = tolower($1) }
     h ~ /^retry-after/ {
       v = $2; gsub(/[^0-9]/, "", v)
       if (v != "" && v + 0 > m) m = v + 0
     }
-    END { if (m > 0) print m }
-  ' "$hdr" 2>/dev/null)"
-  [ -n "$secs" ] || return 0
-  if [ "$secs" -gt "$TEAMCTL_RETRY_CAP" ] 2>/dev/null; then secs="$TEAMCTL_RETRY_CAP"; fi
-  printf '%s' "$secs"
+    END {
+      if (m > cap) m = cap
+      if (m > 0) printf "%d\n", m
+    }
+  ' "$hdr" 2>/dev/null
 }
 
 # wiki_http <ausgabedatei> <curl-argumente...>
