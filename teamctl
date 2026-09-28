@@ -69,6 +69,20 @@ config_error() {
   exit 1
 }
 
+# require_https <schluesselname> <wert> <bezeichnung>
+# Erzwingt das Schema "https://" (exakt klein geschrieben, kein
+# Gross-/Kleinschreibungs-Trick) und bricht ueber config_error ab - die Meldung
+# nennt nur den Schluesselnamen, nie den Wert. <bezeichnung> ist das Substantiv
+# der Meldung (z. B. "die API"/"die URL"), damit die Meldungstexte identisch zu
+# den frueheren, getrennten case-Bloecken bleiben.
+require_https() {
+  local key="$1" val="$2" what="$3"
+  case "$val" in
+    https://*) return 0 ;;
+    *) config_error "$key: ungueltig - $what muss mit https:// beginnen" ;;
+  esac
+}
+
 require_config() {
   local missing=()
   [ -n "$INFRA_HOST" ]   || missing+=("TEAMCTL_INFRA_HOST")
@@ -82,21 +96,11 @@ require_config() {
   fi
   # Sicherheit: der Bearer-Token darf nie ueber Klartext-HTTP gehen - deshalb
   # ist ausschliesslich "https://" erlaubt (exakt klein geschrieben, kein
-  # Gross-/Kleinschreibungs-Trick). Die Meldung nennt nur den Schluesselnamen
-  # TEAMCTL_GIT_API - nie den Wert/die URL.
-  case "$GITHUB_API" in
-    https://*) ;;
-    *) config_error "TEAMCTL_GIT_API: ungueltig - die API muss mit https:// beginnen" ;;
-  esac
-  # Sicherheit: auch die Wiki-URL traegt Zugangsdaten (Session-Cookie/Basic-Auth)
-  # und darf nie ueber Klartext-HTTP gehen - deshalb wie bei TEAMCTL_GIT_API
-  # ausschliesslich "https://" (exakt klein geschrieben, kein
-  # Gross-/Kleinschreibungs-Trick). Die Meldung nennt nur den Schluesselnamen
-  # TEAMCTL_WIKI_URL - nie den Wert/die URL.
-  case "$WIKI_BASE" in
-    https://*) ;;
-    *) config_error "TEAMCTL_WIKI_URL: ungueltig - die URL muss mit https:// beginnen" ;;
-  esac
+  # Gross-/Kleinschreibungs-Trick). Dasselbe gilt fuer die Wiki-URL, die
+  # Zugangsdaten (Session-Cookie/Basic-Auth) traegt. Beide Meldungen nennen nur
+  # den jeweiligen Schluesselnamen - nie den Wert/die URL.
+  require_https TEAMCTL_GIT_API  "$GITHUB_API" "die API"
+  require_https TEAMCTL_WIKI_URL "$WIKI_BASE"  "die URL"
 }
 
 CURL_OPTS=(-sk --max-time 60)
@@ -257,6 +261,11 @@ GIT (GitHub, Konto per Token)
   teamctl git issues-all [--state open|closed|all] [--label <l>]
   teamctl git pulls <repo> [--state open|closed|all] [--label <l>]
   teamctl git pulls-all [--state open|closed|all] [--label <l>]
+
+DOCTOR (Selbstdiagnose, read-only)
+  teamctl doctor
+  (je Pruefung eine TAB-getrennte Zeile <pruefung>\t<OK|WARN|FAIL>\t<detail>;
+   Exit 0 ohne FAIL, 1 bei mindestens einem FAIL; Details ohne Werte)
 
 Hinweis:
   teamctl ist ueber einen Symlink in einem PATH-Verzeichnis (z. B. ~/.local/bin)
@@ -1170,10 +1179,171 @@ git_cmd() {
   esac
 }
 
+# ---------------- Doctor (Selbstdiagnose, read-only) ----------------
+# doctor_cmd prueft Konfiguration und Erreichbarkeit, OHNE Werte auszugeben.
+# Ausgabe: je Pruefung eine Zeile "<pruefung>\t<OK|WARN|FAIL>\t<detail>".
+# Das Detail nennt nur Schluesselnamen/Status/HTTP-Codes - nie Werte (keine URL,
+# kein Host, kein Token, kein Pfad-Inhalt, keine E-Mail).
+# Exit: 0 wenn keine Pruefung FAIL, 1 wenn mindestens eine FAIL (WARN allein -> 0).
+#
+# doctor laeuft im Dispatch VOR require_config/wiki_ca_opts, damit auch eine
+# unvollstaendige oder fehlerhafte Konfiguration gemeldet statt abgebrochen wird.
+# Innerhalb der Pruefungen wird deshalb kein die() verwendet: Helfer, die bei
+# Fehlern abbrechen (wiki_login/wiki_http/wiki_ca_opts/git_token), laufen in
+# einer Subshell - ein Abbruch beendet nur diese Subshell, nicht doctor.
+
+DOCTOR_FAILS=0
+
+# doctor_line <pruefung> <OK|WARN|FAIL> <detail>
+doctor_line() {
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3"
+  if [ "$2" = "FAIL" ]; then DOCTOR_FAILS=$((DOCTOR_FAILS + 1)); fi
+  return 0
+}
+
+# 1) benoetigte Werkzeuge (openssl nur fuer die CA-Pruefung)
+doctor_deps() {
+  local miss=() tool
+  for tool in jq curl; do
+    command -v "$tool" >/dev/null 2>&1 || miss+=("$tool")
+  done
+  if [ -n "$TEAMCTL_WIKI_CA" ] && ! command -v openssl >/dev/null 2>&1; then
+    miss+=("openssl")
+  fi
+  if [ "${#miss[@]}" -gt 0 ]; then
+    doctor_line deps FAIL "fehlt: ${miss[*]}"
+  else
+    doctor_line deps OK "jq/curl vorhanden"
+  fi
+}
+
+# 2) Pflichtwerte gesetzt + https://-Zwang (Details nur Schluesselnamen)
+doctor_config() {
+  local miss=() bad=() det=""
+  [ -n "$INFRA_HOST" ]   || miss+=("TEAMCTL_INFRA_HOST")
+  [ -n "$WIKI_BASE" ]    || miss+=("TEAMCTL_WIKI_URL")
+  [ -n "$WIKI_EMAIL" ]   || miss+=("TEAMCTL_WIKI_EMAIL")
+  [ -n "$BLOG_DIR" ]     || miss+=("TEAMCTL_BLOG_ROOT")
+  [ -n "$GITHUB_OWNER" ] || miss+=("TEAMCTL_GIT_OWNER")
+  [ -n "$GITHUB_API" ]   || miss+=("TEAMCTL_GIT_API")
+  case "$GITHUB_API" in ""|https://*) ;; *) bad+=("TEAMCTL_GIT_API") ;; esac
+  case "$WIKI_BASE"  in ""|https://*) ;; *) bad+=("TEAMCTL_WIKI_URL") ;; esac
+  if [ "${#miss[@]}" -gt 0 ]; then det="fehlt: ${miss[*]}"; fi
+  if [ "${#bad[@]}" -gt 0 ]; then
+    if [ -n "$det" ]; then det="$det; "; fi
+    det="${det}kein https://: ${bad[*]}"
+  fi
+  if [ -n "$det" ]; then
+    doctor_line config FAIL "$det"
+  else
+    doctor_line config OK "Pflichtwerte gesetzt, https:// ok"
+  fi
+}
+
+# 3) Wiki-CA - nur wenn TEAMCTL_WIKI_CA gesetzt ist
+doctor_wiki_ca() {
+  [ -n "$TEAMCTL_WIKI_CA" ] || return 0
+  local detail rc
+  # wiki_ca_opts bricht bei Fehlern per die ab -> in Subshell ausfuehren und den
+  # Klartextgrund uebernehmen (nennt nur TEAMCTL_WIKI_CA, nie den Pfad/Inhalt).
+  detail="$( ( wiki_ca_opts ) 2>&1 )"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    # gueltig: CA-Option ueber den vorhandenen Helfer im Hauptprozess setzen,
+    # damit der Wiki-Aufruf (Pruefung 4) dieselbe TLS-Verifikation nutzt.
+    wiki_ca_opts
+    doctor_line wiki-ca OK "PEM lesbar"
+  else
+    # "teamctl: FEHLER: "-Praefix der die-Meldung entfernen - der Grund selbst
+    # nennt nur TEAMCTL_WIKI_CA (nie den Pfad/Inhalt).
+    detail="${detail#teamctl: FEHLER: }"
+    [ -n "$detail" ] || detail="TEAMCTL_WIKI_CA: ungueltig"
+    doctor_line wiki-ca FAIL "$detail"
+  fi
+}
+
+# 4) Wiki: Login + POST /api/spaces/ ueber die vorhandene Login-/API-Logik.
+# Laeuft in einer Subshell; ein die() beendet nur die Subshell.
+doctor_wiki_probe() {
+  if ! wiki_login "$WIKI_AS" >/dev/null 2>&1; then
+    printf 'LOGIN'
+    return 0
+  fi
+  wiki_api "spaces/" '{}' >/dev/null 2>&1
+  if [ -n "$WIKI_HTTP" ]; then printf 'HTTP %s' "$WIKI_HTTP"; else printf 'HTTP -'; fi
+}
+
+doctor_wiki_api() {
+  local res
+  res="$(doctor_wiki_probe 2>/dev/null)"
+  case "$res" in
+    "HTTP 200") doctor_line wiki-api OK "HTTP 200" ;;
+    "HTTP "*)   doctor_line wiki-api FAIL "$res" ;;
+    "LOGIN")    doctor_line wiki-api FAIL "Login fehlgeschlagen (kein HTTP-Code)" ;;
+    *)          doctor_line wiki-api FAIL "keine HTTP-Antwort (Login/Verbindung)" ;;
+  esac
+}
+
+# 5) GitHub-Token lesbar und nicht leer (Token wird NIE ausgegeben).
+# Der Token wird - wie in git_cmd - in die globale Variable TOK gelegt, damit
+# die folgende gh_api-Pruefung ihn als Bearer-Header nutzt.
+doctor_git_token() {
+  local rc
+  TOK="$(git_token 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "$TOK" ]; then
+    doctor_line git-token OK "Token lesbar"
+  else
+    TOK=""
+    doctor_line git-token FAIL "Token nicht lesbar/leer (TEAMCTL_GITHUB_TOKEN_CMD)"
+  fi
+}
+
+# 6) GitHub-API: GET /user ueber gh_api
+doctor_git_api() {
+  local rc code
+  if [ -z "$TOK" ]; then
+    doctor_line git-api FAIL "kein Token (siehe git-token)"
+    return 0
+  fi
+  gh_api GET /user "" >/dev/null 2>&1
+  rc=$?
+  code="$GH_HTTP"
+  [ -n "$code" ] || code="-"
+  if [ "$rc" -eq 0 ] && [ "$code" = "200" ]; then
+    doctor_line git-api OK "HTTP 200"
+  else
+    doctor_line git-api FAIL "HTTP $code"
+  fi
+}
+
+# 7) SSH-Key: nur Warnung (kein Abbruch)
+doctor_ssh_key() {
+  if [ -f "$SSH_KEY" ]; then
+    doctor_line ssh-key OK "vorhanden"
+  else
+    doctor_line ssh-key WARN "Datei fehlt (TEAMCTL_SSH_KEY)"
+  fi
+}
+
+doctor_cmd() {
+  DOCTOR_FAILS=0
+  doctor_deps
+  doctor_config
+  doctor_wiki_ca
+  doctor_wiki_api
+  doctor_git_token
+  doctor_git_api
+  doctor_ssh_key
+  if [ "$DOCTOR_FAILS" -gt 0 ]; then return 1; fi
+  return 0
+}
+
 # ---------------- Dispatch ----------------
 cmd="${1:-}"; shift || true
 case "$cmd" in
   ""|-h|--help|help) usage; exit 0 ;;
+  doctor) doctor_cmd "$@"; exit $? ;;
 esac
 require_config
 # CA-Zustand EINMAL im Hauptprozess initialisieren (fail-fast, keine Subshell).
@@ -1182,5 +1352,5 @@ case "$cmd" in
   wiki) wiki_cmd "$@" ;;
   blog) blog_cmd "$@" ;;
   git)  git_cmd "$@" ;;
-  *) die "unbekannter Befehl '$cmd' (wiki|blog|git|help)" ;;
+  *) die "unbekannter Befehl '$cmd' (wiki|blog|git|doctor|help)" ;;
 esac
