@@ -440,6 +440,94 @@ else
   pass "git status (negativ): kein Repo -> Abbruch (Exit $grc2)"
 fi
 
+# --- 9) wiki search: Volltext (Titel + Body + Tags-Zeile), Issue #20 -------
+# Offline-Pruefung: die Volltextsuche liest den lokalen Export und braucht
+# kein Netzwerk. Der Fixture-Space 'general' enthaelt eine Seite, die den
+# Suchbegriff NUR in der Tags-Zeile traegt (nicht im Titel).
+WSBIN="$WORK/wsbin"
+mkdir -p "$WSBIN"
+cat > "$WSBIN/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub: kein Netzwerk. Die Volltextsuche braucht keins; der API-Fallback
+# (fehlender Export) muss hier scheitern.
+exit 7
+STUB
+cat > "$WSBIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+# Stub: Dummy-Passwort, damit der API-Fallback schnell und ohne Netz abbricht.
+printf 'dummy\n'
+exit 0
+STUB
+chmod +x "$WSBIN/curl" "$WSBIN/ssh"
+
+WSEARCH="${WORK}/wsearch"
+mkdir -p "$WSEARCH"
+cat > "$WSEARCH/general__wissensdatenbank.md" <<'WSMD'
+---
+title: "Wissensdatenbank"
+space: "general"
+spaceId: "sp-x"
+pageId: "pg-x"
+---
+
+# Wissensdatenbank
+
+Tags: CWE-502, Deserialisierung
+WSMD
+cat > "$WSEARCH/team-dev__ohne-treffer.md" <<'WSMD'
+---
+title: "Ohne Treffer"
+space: "team-dev"
+spaceId: "sp-y"
+pageId: "pg-y"
+---
+
+Kein gesuchter Begriff in dieser Seite.
+WSMD
+printf 'general__wissensdatenbank.md\tpg-x\tgeneral\tWissensdatenbank\nteam-dev__ohne-treffer.md\tpg-y\tteam-dev\tOhne Treffer\n' > "$WSEARCH/.wiki-sync-manifest.tsv"
+
+ws_run() { PATH="$WSBIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' bash "$TEAMCTL" wiki search "$@"; }
+
+# 9a) Treffer nur in der Tags-Zeile wird gefunden (Default = Volltext).
+wsout="$(ws_run CWE-502 --export-dir "$WSEARCH" 2>/dev/null)"
+if [ "$wsout" = "$(printf 'general\tpg-x\tWissensdatenbank')" ]; then
+  pass "wiki search Volltext (Issue #20): Treffer nur in der Tags-Zeile gefunden"
+else
+  fail "wiki search Volltext (Issue #20): erwartet 'general TAB pg-x TAB Wissensdatenbank', war '$wsout'"
+fi
+
+# 9b) Kein Treffer -> leere Ausgabe, Exit 0.
+wsout2="$(ws_run XYZ-NOPE --export-dir "$WSEARCH" 2>/dev/null)"; ws_rc=$?
+if [ "$ws_rc" -eq 0 ] && [ -z "$wsout2" ]; then
+  pass "wiki search Volltext (Issue #20): kein Treffer -> leere Ausgabe, Exit 0"
+else
+  fail "wiki search Volltext (Issue #20): kein Treffer -> rc=$ws_rc, Ausgabe '$wsout2'"
+fi
+
+# 9c) Ohne Manifest: YAML-Kopfzeilen dienen als Index.
+rm -f "$WSEARCH/.wiki-sync-manifest.tsv"
+wsout3="$(ws_run CWE-502 --export-dir "$WSEARCH" 2>/dev/null)"
+if [ "$wsout3" = "$(printf 'general\tpg-x\tWissensdatenbank')" ]; then
+  pass "wiki search Volltext (Issue #20): ohne Manifest via YAML-Kopfzeile gefunden"
+else
+  fail "wiki search Volltext (Issue #20): ohne Manifest -> '$wsout3'"
+fi
+
+# 9d) Veralteter Export -> Hinweis auf stderr (Schwelle 0 Stunden erzwingt ihn).
+ws_err="$(PATH="$WSBIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' TEAMCTL_WIKI_SEARCH_MAX_AGE=0 \
+  bash "$TEAMCTL" wiki search CWE-502 --export-dir "$WSEARCH" 2>&1 >/dev/null)"
+case "$ws_err" in
+  *"alt"*) pass "wiki search Volltext (Issue #20): veralteter Export -> Hinweis auf stderr" ;;
+  *) fail "wiki search Volltext (Issue #20): kein Veraltet-Hinweis (stderr: $ws_err)" ;;
+esac
+
+# 9e) Fehlender Export -> Hinweis + Fallback auf die titelbasierte API-Suche.
+ws_err2="$(ws_run CWE-502 --export-dir "$WSEARCH-nonexistent" 2>&1 >/dev/null)"
+case "$ws_err2" in
+  *"kein Wiki-Export"*) pass "wiki search (Issue #20): fehlender Export -> Hinweis + API-Fallback" ;;
+  *) fail "wiki search (Issue #20): fehlender Export -> kein Hinweis (stderr: $ws_err2)" ;;
+esac
+
 # --- Ergebnis ---------------------------------------------------------------
 if [ "$FAILS" -gt 0 ]; then
   printf 'FAIL: %d Test(s) fehlgeschlagen\n' "$FAILS" >&2
