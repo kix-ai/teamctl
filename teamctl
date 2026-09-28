@@ -279,7 +279,7 @@ GIT (GitHub, Konto per Token)
   teamctl git repos
   teamctl git list <repo> [dir]
   teamctl git create-repo <name> [--public]
-  teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
+  teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>] [--exec|--no-exec]
   teamctl git read <repo> <pfad> [--ref <branch>]
   teamctl git cat <repo> <pfad>          (Alias fuer read)
   teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
@@ -1120,18 +1120,44 @@ git_create_repo() {
   printf '%s' "$GH_BODY" | jq -r '[.full_name, ("private=" + (.private|tostring)), .html_url] | @tsv'
 }
 
+# Schreibt eine Datei ins Repo.
+# Standardpfad ist die Contents-API (mode 100644). Fuer ausfuehrbare lokale
+# Dateien (mode +x) wird die Datei ueber die Git-Data-API geschrieben
+# (blob -> tree mit mode 100755 -> commit -> ref), weil die Contents-API
+# regulaere Dateien IMMER als 100644 speichert und das Executable-Bit damit
+# verloren geht. Optionen: --message <m>, --exec (100755 erzwingen),
+# --no-exec (100644 erzwingen).
 git_upload() {
   [ $# -ge 3 ] || die "git upload: <repo> <pfad> <lokale-datei> fehlt"
   local repo="$1" path="$2" file="$3"; shift 3
   git_require_repo "git upload" "$repo"
   git_path_ok "$path" || die "git upload: ungueltiger Pfad '$path'"
-  local enc; enc="$(git_uri_enc "$path")" || die "git upload: Pfad nicht kodierbar"
-  local msg="teamctl: update $path" sha="" body newsha rsha rsize lsize b64
+  local msg="teamctl: update $path" mode=""
   while [ $# -gt 0 ]; do case "$1" in
     --message) [ $# -ge 2 ] || die "git upload: --message braucht einen Wert"; msg="$2"; shift 2 ;;
+    --exec)    mode="100755"; shift ;;
+    --no-exec) mode="100644"; shift ;;
     *) die "git upload: unbekannte Option '$1'" ;;
   esac; done
   [ -f "$file" ] || die "Datei nicht gefunden: $file"
+  # Mode-Auswahl: explizite Option gewinnt, sonst lokaler Ausfuehrbar-Bit.
+  if [ -z "$mode" ]; then
+    if [ -x "$file" ]; then mode="100755"; else mode="100644"; fi
+  fi
+  if [ "$mode" = "100755" ]; then
+    git_upload_exec "$repo" "$path" "$file" "$msg"
+  else
+    git_upload_plain "$repo" "$path" "$file" "$msg"
+  fi
+}
+
+# git_upload_plain <repo> <pfad> <lokale-datei> <msg>
+# Contents-API-Weg (mode 100644): create/update per PUT /contents, danach
+# Read-back von sha und Groesse. Unveraendertes Altverhalten.
+git_upload_plain() {
+  local repo="$1" path="$2" file="$3" msg="$4"
+  local enc sha="" body newsha rsha rsize lsize b64
+  enc="$(git_uri_enc "$path")" || die "git upload: Pfad nicht kodierbar"
   b64="$(base64 -w0 "$file")"
   if gh_api GET "/repos/$GITHUB_OWNER/$repo/contents/$enc" "" 2>/dev/null; then
     sha="$(printf '%s' "$GH_BODY" | jq -r '.sha // empty')"
@@ -1152,6 +1178,52 @@ git_upload() {
   if [ -n "$newsha" ]; then
     [ "$rsha" = "$newsha" ] || die "git upload: Verifikation fehlgeschlagen (sha remote=$rsha neu=$newsha)"
   fi
+  printf 'OK\t%s/%s\t%s\t%s\n' "$GITHUB_OWNER" "$repo" "$path" "$rsha"
+}
+
+# git_upload_exec <repo> <pfad> <lokale-datei> <msg>
+# Git-Data-API-Weg mit mode 100755 - erhaelt das Executable-Bit:
+#   GET repo -> GET ref/heads/<b> -> GET commit -> GET tree (base_tree)
+#   POST blob (base64) -> POST tree (base_tree + Eintrag mode 100755)
+#   POST commit (parents=[head]) -> PATCH refs/heads/<b>
+# Read-back ueber den Tree des neuen Commits: Mode UND Blob-SHA muessen passen
+# (der Blob-SHA belegt den exakten Inhalt).
+git_upload_exec() {
+  local repo="$1" path="$2" file="$3" msg="$4"
+  local branch benc head base_tree b64 body blob tree commit rmode rsha
+  gh_api GET "/repos/$GITHUB_OWNER/$repo" "" || die "HTTP $GH_HTTP: $(git_err)"
+  branch="$(printf '%s' "$GH_BODY" | jq -r '.default_branch // empty')"
+  [ -n "$branch" ] || die "git upload: Default-Branch nicht ermittelbar"
+  benc="$(git_uri_enc "$branch")" || die "git upload: Branch nicht kodierbar"
+  gh_api GET "/repos/$GITHUB_OWNER/$repo/git/ref/heads/$benc" "" || die "HTTP $GH_HTTP: $(git_err)"
+  head="$(printf '%s' "$GH_BODY" | jq -r '.object.sha // empty')"
+  [ -n "$head" ] || die "git upload: HEAD von '$branch' nicht ermittelbar"
+  gh_api GET "/repos/$GITHUB_OWNER/$repo/git/commits/$head" "" || die "HTTP $GH_HTTP: $(git_err)"
+  base_tree="$(printf '%s' "$GH_BODY" | jq -r '.tree.sha // empty')"
+  [ -n "$base_tree" ] || die "git upload: Basis-Tree nicht ermittelbar"
+  b64="$(base64 -w0 "$file")"
+  body="$(jq -nc --arg c "$b64" '{content:$c,encoding:"base64"}')"
+  gh_api POST "/repos/$GITHUB_OWNER/$repo/git/blobs" "$body" || die "HTTP $GH_HTTP: $(git_err)"
+  blob="$(printf '%s' "$GH_BODY" | jq -r '.sha // empty')"
+  [ -n "$blob" ] || die "git upload: Blob-SHA nicht ermittelbar"
+  body="$(jq -nc --arg t "$base_tree" --arg p "$path" --arg s "$blob" \
+    '{base_tree:$t,tree:[{path:$p,mode:"100755",type:"blob",sha:$s}]}')"
+  gh_api POST "/repos/$GITHUB_OWNER/$repo/git/trees" "$body" || die "HTTP $GH_HTTP: $(git_err)"
+  tree="$(printf '%s' "$GH_BODY" | jq -r '.sha // empty')"
+  [ -n "$tree" ] || die "git upload: Tree-SHA nicht ermittelbar"
+  body="$(jq -nc --arg m "$msg" --arg t "$tree" --arg p "$head" '{message:$m,tree:$t,parents:[$p]}')"
+  gh_api POST "/repos/$GITHUB_OWNER/$repo/git/commits" "$body" || die "HTTP $GH_HTTP: $(git_err)"
+  commit="$(printf '%s' "$GH_BODY" | jq -r '.sha // empty')"
+  [ -n "$commit" ] || die "git upload: Commit-SHA nicht ermittelbar"
+  body="$(jq -nc --arg s "$commit" '{sha:$s}')"
+  gh_api PATCH "/repos/$GITHUB_OWNER/$repo/git/refs/heads/$benc" "$body" || die "HTTP $GH_HTTP: $(git_err)"
+  gh_api GET "/repos/$GITHUB_OWNER/$repo/git/trees/$commit?recursive=1" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
+  printf '%s' "$GH_BODY" | jq -e '.truncated != true' >/dev/null 2>&1 || die "git upload: Read-back-Tree abgeschnitten"
+  rmode="$(printf '%s' "$GH_BODY" | jq -r --arg p "$path" '.tree[] | select(.path==$p) | .mode' | head -1)"
+  rsha="$(printf '%s' "$GH_BODY" | jq -r --arg p "$path" '.tree[] | select(.path==$p) | .sha' | head -1)"
+  [ "$rmode" = "100755" ] || die "git upload: Verifikation fehlgeschlagen (mode=${rmode:-?}, erwartet 100755)"
+  [ "$rsha" = "$blob" ] || die "git upload: Verifikation fehlgeschlagen (sha remote=$rsha blob=$blob)"
+  note "mode 100755 via Git-Data-API gesetzt"
   printf 'OK\t%s/%s\t%s\t%s\n' "$GITHUB_OWNER" "$repo" "$path" "$rsha"
 }
 
