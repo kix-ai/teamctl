@@ -42,9 +42,18 @@ GIT (GitHub, Token aus der Konfiguration)
     teamctl git pulls <repo> [--state open|closed|all] [--label <l>]
     teamctl git pulls-all [--state open|closed|all] [--label <l>]
 
+DOCTOR (Selbstdiagnose, read-only)
+
+    teamctl doctor
+
 ## Konventionen
 
 - Datenausgabe TAB-getrennt und maschinenlesbar; Statuszeilen auf stderr.
+- `teamctl doctor` prueft nur (read-only) und gibt je Pruefung eine Zeile
+  `<pruefung>\t<OK|WARN|FAIL>\t<detail>` aus; Exit 0 ohne FAIL (WARN allein -> 0),
+  1 bei mindestens einem FAIL. Details nennen nur Schluesselnamen/Status/HTTP-Codes.
+  Der Befehl laeuft vor der Pflichtwert-Pruefung: eine unvollstaendige
+  Konfiguration wird als `config FAIL` gemeldet statt abzubrechen.
 - Jeder Schreibbefehl prueft das Ergebnis per Read-back und bricht bei
   Abweichung ab (Exit-Code ungleich 0).
 - Keine Secrets in Ausgaben; Token und Passwoerter werden nur zur Laufzeit gelesen.
