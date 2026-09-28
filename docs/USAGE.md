@@ -10,7 +10,7 @@ WIKI (Docmost)
     teamctl wiki spaces
     teamctl wiki pages <spaceId>
     teamctl wiki get <pageId>
-    teamctl wiki search <begriff>
+    teamctl wiki search <begriff> [--title|--full] [--export-dir DIR]
     teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
     teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
     teamctl wiki upload <pageId> <bilddatei>
@@ -63,6 +63,24 @@ YAML-Kopfzeile (`title`, `space`, `spaceId`, `pageId`).
 - Zugangsdaten kommen aus der teamctl-Konfiguration (`TEAMCTL_WIKI_*`) und
   werden nie ausgegeben oder in die Export-Dateien geschrieben.
 - Exit 0 = vollstaendig, 1 = Fehler.
+
+## Wiki-Suche: Volltext: `teamctl wiki search`
+
+`teamctl wiki search "<begriff>"` sucht standardmaessig im **Volltext**:
+Titel, Body und Tags-Zeile - also auch Begriffe, die nur im Inhalt stehen.
+
+    teamctl wiki search <begriff> [--title|--full] [--export-dir DIR]
+
+- Suchquelle ist der lokale Markdown-Export (`WIKI_EXPORT_DIR`, sonst
+  `~/.openclaw/wiki`), den `teamctl wiki export` pflegt - ohne Netzwerkzugriff.
+- Ausgabe je Treffer: `spaceSlug`, `pageId` und `title` (TAB-getrennt, nach
+  Titel sortiert). `pageId` ermoeglicht `teamctl wiki get <pageId>`.
+- Faellt der Export weg (fehlt/leer), folgt ein Hinweis auf stderr und die
+  titelbasierte API-Suche als Fallback.
+- Ist der Export aelter als `TEAMCTL_WIKI_SEARCH_MAX_AGE` Stunden (Default 24),
+  warnt teamctl auf stderr; die Suche laeuft weiter auf dem Export.
+- `--title` sucht nur Titel ueber die API, `--full` erzwingt die Volltextsuche,
+  `--export-dir DIR` waehlt ein anderes Exportverzeichnis.
 
 ## Konventionen
 

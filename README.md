@@ -84,7 +84,7 @@ WIKI (Docmost)
     teamctl wiki spaces
     teamctl wiki pages <spaceId>
     teamctl wiki get <pageId>
-    teamctl wiki search <begriff>
+    teamctl wiki search <begriff> [--title|--full] [--export-dir DIR]
     teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
     teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
     teamctl wiki upload <pageId> <bilddatei>
@@ -181,6 +181,36 @@ Ist das Default-Ziel nicht beschreibbar, `WIKI_EXPORT_DIR` in `teamctl.env` auf
 einen beschreibbaren Pfad setzen. Derselbe Pfad muss in der
 OpenClaw-Konfiguration unter `memory.search.extraPaths` stehen.
 
+
+## Wiki-Suche mit Volltext: `teamctl wiki search`
+
+`teamctl wiki search "<begriff>"` sucht seit Issue #20 standardmaessig im
+**Volltext** - Titel, Body und Tags-Zeile. Damit findet die Suche auch Seiten,
+die den Begriff nur im Inhalt (z. B. in einer Tags-Zeile) tragen; frueher wurde
+ausschliesslich der Titel durchsucht.
+
+    teamctl wiki search <begriff> [--title|--full] [--export-dir DIR]
+
+- Suchquelle ist der lokale Markdown-Export (`WIKI_EXPORT_DIR`, sonst
+  `~/.openclaw/wiki`), den `teamctl wiki export` pflegt. Die Suche laeuft
+  **lokal** und ohne Netzwerkzugriff; der Index ist das Manifest
+  (`.wiki-sync-manifest.tsv`, bei fehlendem Manifest die YAML-Kopfzeilen).
+- Ausgabe je Treffer TAB-getrennt `spaceSlug<TAB>pageId<TAB>title`, nach Titel
+  sortiert; mit der `pageId` laesst sich die Seite per `teamctl wiki get` lesen.
+- Fehlt der Export (Verzeichnis fehlt/leer), folgt ein Hinweis auf stderr und
+  die **titelbasierte API-Suche** als Fallback.
+- Ist der Export aelter als `TEAMCTL_WIKI_SEARCH_MAX_AGE` Stunden (Default 24),
+  warnt `teamctl` auf stderr - die Suche laeuft trotzdem auf dem Export weiter.
+
+| Option | Bedeutung |
+| --- | --- |
+| `--full` | Volltextsuche ueber den Export erzwingen (Default) |
+| `--title` | nur den Titel ueber die Docmost-API suchen (ohne Export) |
+| `--export-dir DIR` | anderes Exportverzeichnis (sonst `WIKI_EXPORT_DIR`) |
+
+| Variable | Default | Bedeutung |
+| --- | --- | --- |
+| `TEAMCTL_WIKI_SEARCH_MAX_AGE` | `24` | Stunden, ab denen der Export als veraltet gilt |
 
 ## Ausgabe und Fehler
 
