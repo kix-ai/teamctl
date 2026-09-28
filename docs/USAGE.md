@@ -32,7 +32,7 @@ GIT (GitHub, Token aus der Konfiguration)
     teamctl git repos
     teamctl git list <repo> [dir]
     teamctl git create-repo <name> [--public]
-    teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
+    teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>] [--exec|--no-exec]
     teamctl git read <repo> <pfad> [--ref <branch>]      (Alias: git cat)
     teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
     teamctl git pull <dir>
@@ -94,6 +94,10 @@ Titel, Body und Tags-Zeile - also auch Begriffe, die nur im Inhalt stehen.
   Abweichung ab (Exit-Code ungleich 0).
 - Keine Secrets in Ausgaben; Token und Passwoerter werden nur zur Laufzeit gelesen.
 - `git read`/`git cat` liefern Dateiinhalte ueber die GitHub-Contents-API.
+- `git upload` erhaelt das Executable-Bit: ausfuehrbare lokale Dateien (mode +x)
+  gehen ueber die Git-Data-API (mode 100755, blob -> tree -> commit -> ref),
+  sonst Contents-API (mode 100644). `--exec`/`--no-exec` erzwingen den Mode.
+  Grund: die Contents-API speichert regulaere Dateien immer als 100644.
 - `git clone`/`git pull` uebergeben den Token intern als HTTP-Header (nie in URL,
   Kommandozeile oder Ausgabe) und speichern ihn nicht im geklonten Repo.
 
