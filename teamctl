@@ -260,7 +260,7 @@ WIKI (Docmost)
   teamctl wiki get <pageId>
   teamctl wiki search <begriff>
   teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
-  teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend]
+  teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
   teamctl wiki upload <pageId> <bilddatei>
   teamctl wiki me
   teamctl wiki profile --name <name>
@@ -466,10 +466,11 @@ wiki_create() {
 wiki_update() {
   [ $# -ge 1 ] || die "wiki update: <pageId> fehlt"
   local page="$1"; shift
-  local file="" mode="replace" body content probe attempt
+  local file="" mode="replace" parent="" parent_set=0 body content probe attempt
   while [ $# -gt 0 ]; do case "$1" in
     --file) [ $# -ge 2 ] || die "wiki update: --file braucht einen Wert"; file="$2"; shift 2 ;;
     --mode) [ $# -ge 2 ] || die "wiki update: --mode braucht einen Wert"; mode="$2"; shift 2 ;;
+    --parent) [ $# -ge 2 ] || die "wiki update: --parent braucht einen Wert"; parent="$2"; parent_set=1; shift 2 ;;
     --as)   [ $# -ge 2 ] || die "wiki update: --as braucht einen Wert"; WIKI_AS="$2"; shift 2 ;;
     *) die "wiki update: unbekannte Option '$1'" ;;
   esac; done
@@ -477,7 +478,15 @@ wiki_update() {
   [ -f "$file" ] || die "Datei nicht gefunden: $file"
   case "$mode" in replace|append|prepend) ;; *) die "wiki update: ungueltiger --mode '$mode' (replace|append|prepend)" ;; esac
   wiki_login "$WIKI_AS"
-  body="$(jq -nc --arg p "$page" --arg m "$mode" --rawfile c "$file" '{pageId:$p,content:$c,format:"markdown",operation:$m}')"
+  # --parent ist optional. parent_set unterscheidet "nicht angegeben" (kein
+  # parentPageId-Feld) von "--parent ''" (parentPageId:null -> vom Parent loesen).
+  if [ "$parent_set" -eq 0 ]; then
+    body="$(jq -nc --arg p "$page" --arg m "$mode" --rawfile c "$file" '{pageId:$p,content:$c,format:"markdown",operation:$m}')"
+  elif [ -n "$parent" ]; then
+    body="$(jq -nc --arg p "$page" --arg m "$mode" --arg par "$parent" --rawfile c "$file" '{pageId:$p,parentPageId:$par,content:$c,format:"markdown",operation:$m}')"
+  else
+    body="$(jq -nc --arg p "$page" --arg m "$mode" --rawfile c "$file" '{pageId:$p,parentPageId:null,content:$c,format:"markdown",operation:$m}')"
+  fi
   wiki_api_or_die "pages/update" "$body"
   probe="$(grep -oE '[A-Za-z0-9]{6,}' "$file" | head -1)"
   if [ -n "$probe" ]; then
