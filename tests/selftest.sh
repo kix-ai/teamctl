@@ -204,6 +204,75 @@ else
   pass "Fail-Fast (Issue #15): Token-Lesefehler bricht mit genau 1 Meldung ab (Exit 1)"
 fi
 
+# --- 6) doctor: read-only Selbstdiagnose -------------------------------------
+# doctor laeuft VOR der Pflichtwert-Pruefung und darf selbst nicht abbrechen.
+# Fuer einen gruenen Lauf werden curl und ssh durch Erfolgs-Stubs ersetzt
+# (HTTP 200 bzw. Dummy-Passwort); ein Dummy-Key erfuellt die SSH-Key-Pruefung.
+BINOK="$WORK/binok"
+mkdir -p "$BINOK"
+cat > "$BINOK/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub: liefert immer HTTP 200 (kein Netzwerkzugriff).
+printf '200'
+exit 0
+STUB
+cat > "$BINOK/ssh" <<'STUB'
+#!/usr/bin/env bash
+# Stub: liefert ein Dummy-Passwort (kein Netzwerkzugriff).
+printf 'dummy'
+exit 0
+STUB
+chmod +x "$BINOK/curl" "$BINOK/ssh"
+KEYOK="$WORK/id_dummy"
+: > "$KEYOK"
+
+# 6a) Positiv: Exit 0 und KEINE FAIL-Zeile in gruener Umgebung.
+dout="$(PATH="$BINOK:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+  TEAMCTL_GITHUB_TOKEN_CMD='printf selftest-token' \
+  TEAMCTL_WIKI_AS='selftest@selftest.invalid' TEAMCTL_SSH_KEY="$KEYOK" \
+  bash "$TEAMCTL" doctor 2>&1)"
+drc=$?
+if [ "$drc" -ne 0 ]; then
+  fail "doctor 6a (positiv): Exit != 0 (war $drc)"
+  printf '%s\n' "$dout" | sed 's/^/      /' >&2
+elif printf '%s\n' "$dout" | grep -q $'\tFAIL\t'; then
+  fail "doctor 6a (positiv): unerwartete FAIL-Zeile"
+  printf '%s\n' "$dout" | sed 's/^/      /' >&2
+else
+  pass "doctor 6a (positiv): Exit 0, keine FAIL-Zeile"
+fi
+
+# 6a-Format: jede Pruefzeile hat genau 3 TAB-getrennte Felder.
+if [ -z "$dout" ]; then
+  fail "doctor 6a (Format): keine Ausgabe"
+elif printf '%s\n' "$dout" | awk -F'\t' 'NF!=3{exit 1}'; then
+  pass "doctor 6a (Format): jede Zeile <pruefung>\t<status>\t<detail>"
+else
+  fail "doctor 6a (Format): Zeile ohne 3 TAB-Felder"
+  printf '%s\n' "$dout" | sed 's/^/      /' >&2
+fi
+
+# 6b) Negativ: http://-GIT_API -> config FAIL + Exit 1 und KEIN Wert-Leak.
+# Der Befehl muss trotz ungueltiger Konfiguration laufen (nicht vorher abbrechen).
+BADVAL='http://selftest.invalid/api'
+dout2="$(PATH="$BINOK:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+  TEAMCTL_GIT_API="$BADVAL" TEAMCTL_GITHUB_TOKEN_CMD='printf selftest-token' \
+  TEAMCTL_WIKI_AS='selftest@selftest.invalid' TEAMCTL_SSH_KEY="$KEYOK" \
+  bash "$TEAMCTL" doctor 2>&1)"
+drc2=$?
+if [ "$drc2" -ne 1 ]; then
+  fail "doctor 6b (negativ): Exit != 1 (war $drc2)"
+elif printf '%s\n' "$dout2" | grep -q $'^config\tFAIL\t'; then
+  pass "doctor 6b (negativ): config FAIL mit Exit 1"
+else
+  fail "doctor 6b (negativ): keine 'config FAIL'-Zeile"
+  printf '%s\n' "$dout2" | sed 's/^/      /' >&2
+fi
+case "$dout2" in
+  *"$BADVAL"*) fail "doctor 6b (negativ): Ausgabe enthaelt den gesetzten Wert" ;;
+  *) pass "doctor 6b (negativ): kein Wert-Leak (http://-Wert nicht ausgegeben)" ;;
+esac
+
 # --- 5) Optional: Live-Positivtest (echte Konfiguration/Token) --------------
 if [ "${TEAMCTL_SELFTEST_LIVE:-0}" = "1" ]; then
   if bash "$TEAMCTL" git repos >/dev/null 2>&1; then
