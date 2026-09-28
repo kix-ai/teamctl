@@ -12,7 +12,7 @@ WIKI (Docmost)
     teamctl wiki get <pageId>
     teamctl wiki search <begriff> [--title|--full] [--export-dir DIR]
     teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
-    teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
+    teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>|--parent '']
     teamctl wiki upload <pageId> <bilddatei>
     teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
     teamctl wiki me
@@ -81,6 +81,21 @@ Titel, Body und Tags-Zeile - also auch Begriffe, die nur im Inhalt stehen.
   warnt teamctl auf stderr; die Suche laeuft weiter auf dem Export.
 - `--title` sucht nur Titel ueber die API, `--full` erzwingt die Volltextsuche,
   `--export-dir DIR` waehlt ein anderes Exportverzeichnis.
+
+## Wiki umhaengen: `teamctl wiki update --parent`
+
+`--parent <pageId>` haengt eine bestehende Seite unter die Ziel-Seite um,
+`--parent ''` loest sie vom Parent (Root-Ebene).
+
+    teamctl wiki update <pageId> --file <md> --parent <pageId>
+    teamctl wiki update <pageId> --file <md> --parent ''
+
+- Umhaengen laeuft ueber `POST /api/pages/move` (`{pageId, parentPageId,
+  position}`), weil Docmost `parentPageId` in `pages/update` ignoriert (#22).
+  `position` ist Pflicht (5-12 Zeichen fractional index); die Seite landet am
+  Ende der Ziel-Elternliste (Nachbarposition + `V`, leere Liste `a0VVV`).
+- Read-back per `pages/info`: `parentPageId` muss dem Ziel entsprechen, sonst
+  Fehler und Exit != 0. Ohne `--parent` bleibt der Parent unveraendert.
 
 ## Konventionen
 

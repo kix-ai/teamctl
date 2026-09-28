@@ -86,11 +86,11 @@ WIKI (Docmost)
     teamctl wiki get <pageId>
     teamctl wiki search <begriff> [--title|--full] [--export-dir DIR]
     teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
-    teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
+    teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>|--parent '']
     teamctl wiki upload <pageId> <bilddatei>
     teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
     (optional ueberall: --as <email|name>)
-    (wiki update: --parent '' loest die Seite vom Parent)
+    (wiki update --parent <pageId> haengt die Seite um; --parent '' loest sie auf Root)
 
 BLOG (statische Seite auf dem Host)
 
@@ -226,6 +226,30 @@ ausschliesslich der Titel durchsucht.
 | Variable | Default | Bedeutung |
 | --- | --- | --- |
 | `TEAMCTL_WIKI_SEARCH_MAX_AGE` | `24` | Stunden, ab denen der Export als veraltet gilt |
+
+## Wiki-Seite umhaengen: `teamctl wiki update --parent`
+
+`--parent <pageId>` haengt eine **bestehende** Seite unter die Ziel-Seite um;
+`--parent ''` loest sie vom Parent und setzt sie auf Root-Ebene (Issue #22).
+
+    teamctl wiki update <pageId> --file <md> [--parent <pageId>]
+    teamctl wiki update <pageId> --file <md> --parent ''
+
+- `wiki create --parent` setzt den Parent beim Anlegen; `wiki update --parent`
+  haengt danach um. Beides laeuft ueber die Docmost-API.
+- Docmost ignoriert `parentPageId` in `POST /api/pages/update` (Issue #22). Das
+  Umhaengen laeuft deshalb ueber `POST /api/pages/move` mit
+  `{pageId, parentPageId, position}`; `position` ist PFLICHT (5-12 Zeichen,
+  fractional index).
+- Die Seite landet am **Ende** der Ziel-Elternliste. Die Position wird aus der
+  groessten Nachbarposition gebildet (`position + 'V'`; leere Liste: `a0VVV`),
+  ohne die Seite selbst. Ist die Nachbarposition bereits 12 Zeichen lang, bricht
+  `teamctl` mit klarer Meldung ab (keine ungueltige Position).
+- **Read-back:** Danach liest `teamctl` die Seite per `pages/info` und prueft
+  `parentPageId` gegen das Ziel; bei Abweichung folgt eine Meldung und Exit != 0.
+  So faellt ein stilles Ignorieren des Umhaengens sofort auf.
+- Der Inhalt wird wie bisher per `pages/update` geschrieben; `--parent` steht
+  nur beim Umhaengen. Ohne `--parent` aendert `wiki update` den Parent nicht.
 
 ## Ausgabe und Fehler
 
