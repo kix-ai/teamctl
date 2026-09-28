@@ -260,7 +260,7 @@ WIKI (Docmost)
   teamctl wiki get <pageId>
   teamctl wiki search <begriff> [--title|--full] [--export-dir DIR]
   teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
-  teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
+  teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>|--parent '']
   teamctl wiki upload <pageId> <bilddatei>
   teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
   teamctl wiki me
@@ -303,6 +303,9 @@ Hinweis:
   'teamctl wiki export'); ohne Export folgt ein Hinweis + titelbasierter
   API-Fallback. --title sucht nur Titel ueber die API, --export-dir DIR
   waehlt ein anderes Exportverzeichnis.
+  teamctl wiki update --parent <pageId> haengt eine bestehende Seite um
+  (pages/move + Read-back); --parent '' loest sie vom Parent auf Root. Ohne
+  --parent bleibt der Parent unveraendert.
   teamctl ist ueber einen Symlink in einem PATH-Verzeichnis (z. B. ~/.local/bin)
   auch ohne vollen Pfad als "teamctl" aufrufbar. Bei HTTP 429 (Too Many Requests)
   wiederholt teamctl Wiki-Aufrufe automatisch mit exponentiellem Backoff + Jitter
@@ -555,6 +558,66 @@ wiki_create() {
   printf '%s\n' "$id"
 }
 
+# wiki_pos_after <nachbarposition>
+# Erzeugt eine fractional-index-Position, die NACH <nachbarposition> sortiert.
+# Docmost verlangt beim Umhaengen (pages/move) eine position von 5-12 Zeichen
+# und sortiert lexikographisch. Leere Liste -> Startwert "a0VVV"; sonst wird
+# 'V' angehaengt, was garantiert dahinter sortiert. Rueckgabe != 0, wenn die
+# Nachbarposition bereits die Maximalbreite von 12 Zeichen erreicht hat.
+wiki_pos_after() {
+  local max="$1" out
+  if [ -z "$max" ]; then out="a0"; else out="$max"; fi
+  out="${out}V"
+  while [ "${#out}" -lt 5 ]; do out="${out}V"; done
+  [ "${#out}" -le 12 ] || return 1
+  printf '%s' "$out"
+}
+
+# wiki_reparent <pageId> <zielParentPageId|"">
+# Haengt eine bestehende Seite um. Docmost ignoriert parentPageId in
+# pages/update (Issue #22) - das Umhaengen laeuft daher ueber
+# POST /api/pages/move {pageId, parentPageId, position}; position ist Pflicht.
+# Ein leerer Zielwert loest die Seite vom Parent (parentPageId null = Root).
+# Die Seite landet am ENDE der Ziel-Elternliste: Position = groesste
+# Nachbarposition (ohne die Seite selbst) + 'V', bei leerer Liste "a0VVV".
+# Read-back ueber pages/info: parentPageId muss dem Ziel entsprechen, sonst
+# Fehler (Exit != 0).
+wiki_reparent() {
+  local page="$1" target="$2"
+  local space siblings maxpos newpos body cur
+  wiki_api_or_die "pages/info" "$(jq -nc --arg p "$page" '{pageId:$p}')" \
+    || die "wiki update: Seite nicht lesbar (id=$page)"
+  space="$(printf '%s' "$WIKI_BODY" | jq -r '.data.spaceId // empty')"
+  [ -n "$space" ] || die "wiki update: spaceId nicht ermittelbar (id=$page)"
+  if [ -n "$target" ]; then
+    wiki_fetch_sidebar "$space" "$target" \
+      || die "wiki update: Ziel-Parent '$target' nicht lesbar"
+  else
+    wiki_fetch_sidebar "$space" "" \
+      || die "wiki update: Seitenliste des Space nicht lesbar"
+  fi
+  siblings="$(printf '%s' "$WIKI_BODY" | jq -r --arg self "$page" \
+    '.data.items[]? | select(.id != $self) | .position // empty')"
+  maxpos="$(printf '%s\n' "$siblings" | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | last // ""')"
+  newpos="$(wiki_pos_after "$maxpos")" \
+    || die "wiki update: --parent: keine gueltige position generierbar (Nachbarposition hat bereits die Maximalbreite von 12 Zeichen)"
+  if [ -n "$target" ]; then
+    body="$(jq -nc --arg p "$page" --arg par "$target" --arg pos "$newpos" \
+      '{pageId:$p,parentPageId:$par,position:$pos}')"
+  else
+    body="$(jq -nc --arg p "$page" --arg pos "$newpos" \
+      '{pageId:$p,parentPageId:null,position:$pos}')"
+  fi
+  wiki_api_or_die "pages/move" "$body" \
+    || die "wiki update: Umhaengen fehlgeschlagen (id=$page, HTTP $WIKI_HTTP)"
+  wiki_api_or_die "pages/info" "$(jq -nc --arg p "$page" '{pageId:$p}')" \
+    || die "wiki update: Read-back fehlgeschlagen (id=$page)"
+  cur="$(printf '%s' "$WIKI_BODY" | jq -r '.data.parentPageId // empty')"
+  if [ "$cur" != "$target" ]; then
+    die "wiki update: Verifikation fehlgeschlagen - parentPageId ist '${cur:-null}', erwartet '${target:-null}' (id=$page)"
+  fi
+}
+
 wiki_update() {
   [ $# -ge 1 ] || die "wiki update: <pageId> fehlt"
   local page="$1"; shift
@@ -570,16 +633,15 @@ wiki_update() {
   [ -f "$file" ] || die "Datei nicht gefunden: $file"
   case "$mode" in replace|append|prepend) ;; *) die "wiki update: ungueltiger --mode '$mode' (replace|append|prepend)" ;; esac
   wiki_login "$WIKI_AS"
-  # --parent ist optional. parent_set unterscheidet "nicht angegeben" (kein
-  # parentPageId-Feld) von "--parent ''" (parentPageId:null -> vom Parent loesen).
-  if [ "$parent_set" -eq 0 ]; then
-    body="$(jq -nc --arg p "$page" --arg m "$mode" --rawfile c "$file" '{pageId:$p,content:$c,format:"markdown",operation:$m}')"
-  elif [ -n "$parent" ]; then
-    body="$(jq -nc --arg p "$page" --arg m "$mode" --arg par "$parent" --rawfile c "$file" '{pageId:$p,parentPageId:$par,content:$c,format:"markdown",operation:$m}')"
-  else
-    body="$(jq -nc --arg p "$page" --arg m "$mode" --rawfile c "$file" '{pageId:$p,parentPageId:null,content:$c,format:"markdown",operation:$m}')"
+  # parentPageId in pages/update wird von Docmost ignoriert (Issue #22) und
+  # daher nicht mehr mitgesendet; --parent laeuft ueber pages/move.
+  body="$(jq -nc --arg p "$page" --arg m "$mode" --rawfile c "$file" '{pageId:$p,content:$c,format:"markdown",operation:$m}')"
+  wiki_api_or_die "pages/update" "$body" \
+    || die "wiki update: Inhalt konnte nicht geschrieben werden (id=$page, HTTP $WIKI_HTTP)"
+  # --parent setzt/loest den Parent TATSAECHLICH (move + Read-back).
+  if [ "$parent_set" -eq 1 ]; then
+    wiki_reparent "$page" "$parent"
   fi
-  wiki_api_or_die "pages/update" "$body"
   probe="$(grep -oE '[A-Za-z0-9]{6,}' "$file" | head -1)"
   if [ -n "$probe" ]; then
     # Der Read-back direkt nach pages/update kann noch veralteten Inhalt
