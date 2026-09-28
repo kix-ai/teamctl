@@ -496,10 +496,11 @@ else
   fail "wiki search Volltext (Issue #20): erwartet 'general TAB pg-x TAB Wissensdatenbank', war '$wsout'"
 fi
 
-# 9b) Kein Treffer -> leere Ausgabe, Exit 0.
+# 9b) Kein Treffer -> leere Ausgabe, Exit 1 (wie grep; entspricht dem alten
+# Verhalten der titelbasierten Suche unter 'set -o pipefail').
 wsout2="$(ws_run XYZ-NOPE --export-dir "$WSEARCH" 2>/dev/null)"; ws_rc=$?
-if [ "$ws_rc" -eq 0 ] && [ -z "$wsout2" ]; then
-  pass "wiki search Volltext (Issue #20): kein Treffer -> leere Ausgabe, Exit 0"
+if [ "$ws_rc" -eq 1 ] && [ -z "$wsout2" ]; then
+  pass "wiki search Volltext (Issue #20): kein Treffer -> leere Ausgabe, Exit 1"
 else
   fail "wiki search Volltext (Issue #20): kein Treffer -> rc=$ws_rc, Ausgabe '$wsout2'"
 fi
