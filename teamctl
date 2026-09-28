@@ -258,7 +258,7 @@ WIKI (Docmost)
   teamctl wiki spaces
   teamctl wiki pages <spaceId>
   teamctl wiki get <pageId>
-  teamctl wiki search <begriff>
+  teamctl wiki search <begriff> [--title|--full] [--export-dir DIR]
   teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
   teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
   teamctl wiki upload <pageId> <bilddatei>
@@ -298,6 +298,11 @@ DOCTOR (Selbstdiagnose, read-only)
    Exit 0 ohne FAIL, 1 bei mindestens einem FAIL; Details ohne Werte)
 
 Hinweis:
+  teamctl wiki search sucht standardmaessig im VOLLTEXT (Titel, Body und
+  Tags-Zeile) des lokalen Exports (~/.openclaw/wiki, gepflegt von
+  'teamctl wiki export'); ohne Export folgt ein Hinweis + titelbasierter
+  API-Fallback. --title sucht nur Titel ueber die API, --export-dir DIR
+  waehlt ein anderes Exportverzeichnis.
   teamctl ist ueber einen Symlink in einem PATH-Verzeichnis (z. B. ~/.local/bin)
   auch ohne vollen Pfad als "teamctl" aufrufbar. Bei HTTP 429 (Too Many Requests)
   wiederholt teamctl Wiki-Aufrufe automatisch mit exponentiellem Backoff + Jitter
@@ -405,12 +410,92 @@ wiki_collect_pages() {
   done < <(printf '%s' "$json" | jq -r '.[] | [.id, .title, (.hasChildren|tostring)] | @tsv')
 }
 
-# Sucht seitenuebergreifend nach Seitentiteln (case-insensitive, fester String).
-# Ausgabe: spaceSlug<TAB>pageId<TAB>title.
+# Sucht Wiki-Seiten (case-insensitive, fester String). Ausgabe je Treffer:
+# spaceSlug<TAB>pageId<TAB>title (nach Titel sortiert).
+#
+# Standard ist die VOLLTEXTSUCHE ueber Titel, Body und Tags-Zeile. Quelle ist
+# der lokale Markdown-Export (WIKI_EXPORT_DIR bzw. ~/.openclaw/wiki), den
+# 'teamctl wiki export' pflegt - ohne Netzwerkzugriff. Existiert kein Export,
+# folgt ein Hinweis und die titelbasierte API-Suche als Fallback. Ist der
+# Export aelter als TEAMCTL_WIKI_SEARCH_MAX_AGE Stunden (Default 24), warnt
+# teamctl auf stderr; die Suche laeuft trotzdem auf dem Export weiter.
+#
+# Optionen:
+#   --title             nur Titel ueber die Docmost-API suchen (ohne Export)
+#   --full              Volltextsuche ueber den Export erzwingen (Default)
+#   --export-dir DIR    anderes Exportverzeichnis (sonst WIKI_EXPORT_DIR)
 wiki_search() {
-  [ $# -ge 1 ] || die "wiki search: <begriff> fehlt"
+  local q="" mode="full" exp_dir=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --title)      mode="title"; shift ;;
+    --full)       mode="full"; shift ;;
+    --export-dir) [ $# -ge 2 ] || die "wiki search: --export-dir braucht einen Wert"; exp_dir="$2"; shift 2 ;;
+    --)           shift; break ;;
+    -*)           die "wiki search: unbekannte Option '$1'" ;;
+    *)            [ -z "$q" ] || die "wiki search: nur ein Suchbegriff erlaubt"; q="$1"; shift ;;
+  esac; done
+  if [ -z "$q" ] && [ $# -ge 1 ]; then q="$1"; shift; fi
+  [ $# -eq 0 ] || die "wiki search: nur ein Suchbegriff erlaubt"
+  [ -n "$q" ] || die "wiki search: <begriff> fehlt"
+  if [ "$mode" = "full" ]; then
+    local dir="${exp_dir:-${WIKI_EXPORT_DIR:-$HOME/.openclaw/wiki}}"
+    if [ -d "$dir" ] && { [ -f "$dir/.wiki-sync-manifest.tsv" ] || [ -n "$(find "$dir" -maxdepth 1 -type f -name '*.md' -print -quit 2>/dev/null)" ]; }; then
+      wiki_search_stale_note "$dir"
+      wiki_search_export "$q" "$dir" | sort -f -t $'\t' -k3,3
+      return 0
+    fi
+    note "wiki search: kein Wiki-Export in '$dir' gefunden - Fallback auf titelbasierte API-Suche; fuer die Volltextsuche 'teamctl wiki export' ausfuehren."
+  fi
+  wiki_search_titles "$q"
+}
+
+# wiki_search_stale_note <dir>
+# Warnt auf stderr, wenn der Export aelter als TEAMCTL_WIKI_SEARCH_MAX_AGE
+# Stunden (Default 24) ist. Bezug ist die neueste Datei (Seite oder Manifest).
+wiki_search_stale_note() {
+  local dir="$1" max_age="${TEAMCTL_WIKI_SEARCH_MAX_AGE:-24}" newest now age_h
+  case "$max_age" in ''|*[!0-9]*) max_age=24 ;; esac
+  newest="$(find "$dir" -maxdepth 1 -type f \( -name '*.md' -o -name '.wiki-sync-manifest.tsv' \) -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)"
+  [ -n "$newest" ] || return 0
+  now="$(date +%s)"
+  age_h=$(( (now - newest) / 3600 ))
+  if [ "$age_h" -ge "$max_age" ]; then
+    note "wiki search: Export ist ca. ${age_h}h alt (>= ${max_age}h) - fuer aktuelle Treffer 'teamctl wiki export' ausfuehren."
+  fi
+  return 0
+}
+
+# wiki_search_export <begriff> <dir>
+# Volltextsuche ueber die Markdown-Dateien eines Export-Verzeichnisses
+# (Titel, Body und Tags-Zeile). Index ist das Manifest
+# (.wiki-sync-manifest.tsv: fname<TAB>pageId<TAB>spaceSlug<TAB>title);
+# fehlt es, werden die YAML-Kopfzeilen (title/space/pageId) gelesen.
+wiki_search_export() {
+  local q="$1" dir="$2" fname pageId space title f
+  if [ -f "$dir/.wiki-sync-manifest.tsv" ]; then
+    while IFS=$'\t' read -r fname pageId space title; do
+      [ -n "$fname" ] || continue
+      [ -f "$dir/$fname" ] || continue
+      grep -qiF -- "$q" "$dir/$fname" || continue
+      printf '%s\t%s\t%s\n' "$space" "$pageId" "$title"
+    done < "$dir/.wiki-sync-manifest.tsv"
+    return 0
+  fi
+  while IFS= read -r -d '' f; do
+    grep -qiF -- "$q" "$f" || continue
+    pageId="$(sed -n 's/^pageId:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$f" | head -1)"
+    space="$(sed -n  's/^space:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$f" | head -1)"
+    title="$(sed -n  's/^title:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$f" | head -1)"
+    printf '%s\t%s\t%s\n' "$space" "$pageId" "$title"
+  done < <(find "$dir" -maxdepth 1 -type f -name '*.md' -print0 2>/dev/null)
+  return 0
+}
+
+# wiki_search_titles <begriff>
+# Sucht seitenuebergreifend nur nach Seitentiteln ueber die Docmost-API
+# (case-insensitive, fester String). Ausgabe: spaceSlug<TAB>pageId<TAB>title.
+wiki_search_titles() {
   local q="$1" tmp
-  [ -n "$q" ] || die "wiki search: Suchbegriff leer"
   wiki_login "$WIKI_AS"
   wiki_api_or_die "spaces/" '{}'
   local spaces
