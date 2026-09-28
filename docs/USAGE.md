@@ -14,6 +14,7 @@ WIKI (Docmost)
     teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
     teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
     teamctl wiki upload <pageId> <bilddatei>
+    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
     teamctl wiki me
     teamctl wiki profile --name <name>
 
@@ -46,6 +47,22 @@ GIT (GitHub, Token aus der Konfiguration)
 DOCTOR (Selbstdiagnose, read-only)
 
     teamctl doctor
+
+## Wiki-Export: `teamctl wiki export`
+
+Exportiert alle Docmost-Seiten (oder mit `--space <spaceId>` nur einen Space)
+als Markdown: eine Datei je Seite `<space-slug>__<page-slug>.md` mit
+YAML-Kopfzeile (`title`, `space`, `spaceId`, `pageId`).
+
+    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
+
+- Default-Ziel: `WIKI_EXPORT_DIR`, sonst `~/.openclaw/wiki`.
+- Idempotent ueber ein Manifest (`.wiki-sync-manifest.tsv`); im Wiki geloeschte
+  Seiten werden aus dem Ziel entfernt (ausser mit `--no-prune`).
+- `--dry-run` zeigt nur die Aenderungen, `--quiet` unterdrueckt den Fortschritt.
+- Zugangsdaten kommen aus der teamctl-Konfiguration (`TEAMCTL_WIKI_*`) und
+  werden nie ausgegeben oder in die Export-Dateien geschrieben.
+- Exit 0 = vollstaendig, 1 = Fehler.
 
 ## Konventionen
 
