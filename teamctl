@@ -192,10 +192,33 @@ retry_delay() {
   printf '%s' "$(( 1 + RANDOM % d ))"
 }
 
+# retry_after_secs <headerdatei> -> begrenzte Wartezeit in Sekunden oder leer
+# Wertet JEDEN retry-after*-Header aus (case-insensitive): den Standard
+# "Retry-After" ebenso wie den vom Wiki bei HTTP 429 gelieferten
+# "retry-after-auth". Bei mehreren Angaben gilt der groesste Wert; das Ergebnis
+# wird auf TEAMCTL_RETRY_CAP begrenzt, damit ein unbrauchbarer Headerwert
+# (z. B. ein HTTP-Datum) die Wartezeit nicht sprengt.
+retry_after_secs() {
+  local hdr="$1" secs
+  secs="$(awk '
+    BEGIN { m = 0 }
+    { h = tolower($1) }
+    h ~ /^retry-after/ {
+      v = $2; gsub(/[^0-9]/, "", v)
+      if (v != "" && v + 0 > m) m = v + 0
+    }
+    END { if (m > 0) print m }
+  ' "$hdr" 2>/dev/null)"
+  [ -n "$secs" ] || return 0
+  if [ "$secs" -gt "$TEAMCTL_RETRY_CAP" ] 2>/dev/null; then secs="$TEAMCTL_RETRY_CAP"; fi
+  printf '%s' "$secs"
+}
+
 # wiki_http <ausgabedatei> <curl-argumente...>
 # Fuehrt einen Wiki-HTTP-Aufruf aus und wiederholt ihn bei HTTP 429.
 # Gibt den HTTP-Code auf stdout aus; der Body landet in <ausgabedatei>.
-# Ein vorhandener "Retry-After"-Header wird respektiert.
+# Ein vorhandener retry-after*-Header (Standard "Retry-After" oder der vom Wiki
+# bei HTTP 429 gelieferte "retry-after-auth") wird respektiert.
 wiki_http() {
   local out="$1"; shift
   local hdr attempt=0 code delay ra
@@ -215,7 +238,7 @@ wiki_http() {
     fi
     attempt=$(( attempt + 1 ))
     delay="$(retry_delay "$attempt")"
-    ra="$(awk 'BEGIN{IGNORECASE=1} /^Retry-After:/{gsub(/[^0-9]/,"",$2); if ($2 != "") {print $2; exit}}' "$hdr" 2>/dev/null)"
+    ra="$(retry_after_secs "$hdr")"
     if [ -n "$ra" ] && [ "$ra" -gt "$delay" ] 2>/dev/null; then delay="$ra"; fi
     note "Wiki: HTTP 429 (Too Many Requests) - Wiederholung $attempt/$TEAMCTL_RETRY_MAX in ${delay}s"
     sleep "$delay"

@@ -284,6 +284,111 @@ else
   printf 'SKIP: Live-Positivtest (TEAMCTL_SELFTEST_LIVE=1 zum Aktivieren)\n'
 fi
 
+# --- 7) Retry: retry-after-auth respektieren (Issue #16) ---------------------
+# Der Wiki-Host liefert bei HTTP 429 den Header "retry-after-auth: <sek>" statt
+# "Retry-After". Frueher wurde nur /^Retry-After:/ geparst, daher wartete teamctl
+# nur das kurze Backoff ab und lief erneut in 429. Geprueft wird (a) der Parser
+# retry_after_secs direkt (ohne Netzwerk) und (b) ein Ende-zu-Ende-Lauf ueber
+# "wiki me" mit curl-/ssh-/sleep-Stubs (kein Netzwerk, keine echte Wartezeit).
+RAS="$WORK/retry_after_secs.sh"
+awk '/^retry_after_secs\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$TEAMCTL" > "$RAS"
+if [ ! -s "$RAS" ]; then
+  fail "Retry-Parser (Issue #16): retry_after_secs fehlt in teamctl"
+else
+  . "$RAS"
+  H_CASE="$WORK/hdr-case";  printf 'Retry-After-Auth: 22\r\nContent-Type: application/json\r\n' > "$H_CASE"
+  H_STD="$WORK/hdr-std";    printf 'retry-after: 7\n' > "$H_STD"
+  H_MULTI="$WORK/hdr-multi"; printf 'Retry-After: 5\nretry-after-auth: 9\n' > "$H_MULTI"
+  H_NONE="$WORK/hdr-none";  printf 'Content-Type: application/json\n' > "$H_NONE"
+  H_CAP="$WORK/hdr-cap";    printf 'retry-after-auth: 999\n' > "$H_CAP"
+
+  TEAMCTL_RETRY_CAP=30
+  ra_out="$(retry_after_secs "$H_CASE")"
+  if [ "$ra_out" = "22" ]; then pass "Retry-Parser (Issue #16): 'Retry-After-Auth' case-insensitiv -> 22s"
+  else fail "Retry-Parser (Issue #16): 'Retry-After-Auth' -> '$ra_out' (erwartet 22)"; fi
+
+  ra_out="$(retry_after_secs "$H_STD")"
+  if [ "$ra_out" = "7" ]; then pass "Retry-Parser (Issue #16): Standard 'retry-after' -> 7s"
+  else fail "Retry-Parser (Issue #16): Standard 'retry-after' -> '$ra_out' (erwartet 7)"; fi
+
+  ra_out="$(retry_after_secs "$H_MULTI")"
+  if [ "$ra_out" = "9" ]; then pass "Retry-Parser (Issue #16): mehrere retry-after*-Header -> 9s (groesster Wert)"
+  else fail "Retry-Parser (Issue #16): mehrere Header -> '$ra_out' (erwartet 9)"; fi
+
+  ra_out="$(retry_after_secs "$H_NONE")"
+  if [ -z "$ra_out" ]; then pass "Retry-Parser (Issue #16): ohne retry-after* -> leer (Backoff bleibt)"
+  else fail "Retry-Parser (Issue #16): ohne retry-after* -> '$ra_out' (erwartet leer)"; fi
+
+  TEAMCTL_RETRY_CAP=4
+  ra_out="$(retry_after_secs "$H_CAP")"
+  if [ "$ra_out" = "4" ]; then pass "Retry-Parser (Issue #16): Headerwert 999s auf TEAMCTL_RETRY_CAP=4 begrenzt"
+  else fail "Retry-Parser (Issue #16): Begrenzung -> '$ra_out' (erwartet 4)"; fi
+  TEAMCTL_RETRY_CAP=30
+fi
+
+# 7b) Ende-zu-Ende: wiki_http wartet die retry-after-auth-Zeit ab (Issue #16).
+# curl-Stub: 1. Aufruf HTTP 429 mit "retry-after-auth: 3", danach HTTP 200.
+# sleep-Stub: protokolliert die Wartezeit statt zu schlafen.
+E2E="$WORK/e2e"
+mkdir -p "$E2E"
+E2E_CNT="$WORK/e2e.cnt"; E2E_SLEEP="$WORK/e2e.sleep"
+: > "$E2E_CNT"; : > "$E2E_SLEEP"
+cat > "$E2E/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub: 1. Aufruf HTTP 429 mit retry-after-auth, danach HTTP 200 (kein Netz).
+n=1
+[ -s "$E2E_CNT" ] && n=$(( $(cat "$E2E_CNT") + 1 ))
+printf '%s' "$n" > "$E2E_CNT"
+out=/dev/null; hdr=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -D) hdr="$2"; shift 2 ;;
+    *)  shift ;;
+  esac
+done
+if [ "$n" -eq 1 ]; then
+  [ -n "$hdr" ] && printf 'HTTP/1.1 429 Too Many Requests\r\nretry-after-auth: 3\r\n\r\n' > "$hdr"
+  printf '{"message":"too many requests"}' > "$out"
+  printf '429'
+else
+  [ -n "$hdr" ] && printf 'HTTP/1.1 200 OK\r\n\r\n' > "$hdr"
+  printf '{"data":{"user":{"name":"selftest"}}}' > "$out"
+  printf '200'
+fi
+STUB
+cat > "$E2E/sleep" <<'STUB'
+#!/usr/bin/env bash
+# Stub: protokolliert die Wartezeit statt zu schlafen.
+printf '%s\n' "$1" >> "$E2E_SLEEP"
+exit 0
+STUB
+cat > "$E2E/ssh" <<'STUB'
+#!/usr/bin/env bash
+# Stub: liefert ein Dummy-Passwort (kein Netzwerkzugriff).
+printf 'dummy\n'
+exit 0
+STUB
+chmod +x "$E2E/curl" "$E2E/sleep" "$E2E/ssh"
+E2E_KEY="$WORK/id_e2e_dummy"; : > "$E2E_KEY"
+
+e2e_out="$(PATH="$E2E:$PATH" E2E_CNT="$E2E_CNT" E2E_SLEEP="$E2E_SLEEP" \
+  TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' TEAMCTL_WIKI_AS='selftest@selftest.invalid' \
+  TEAMCTL_SSH_KEY="$E2E_KEY" bash "$TEAMCTL" wiki me 2>&1)"
+e2e_rc=$?
+if [ "$e2e_rc" -ne 0 ]; then
+  fail "Retry E2E (Issue #16): 'wiki me' Exit != 0 (war $e2e_rc)"
+  printf '%s\n' "$e2e_out" | sed 's/^/      /' >&2
+elif ! grep -qx '3' "$E2E_SLEEP"; then
+  fail "Retry E2E (Issue #16): Wartezeit aus retry-after-auth nicht genutzt (sleep: $(tr '\n' ' ' < "$E2E_SLEEP"))"
+  printf '%s\n' "$e2e_out" | sed 's/^/      /' >&2
+elif ! printf '%s' "$e2e_out" | grep -q 'selftest'; then
+  fail "Retry E2E (Issue #16): Ausgabe ohne Erfolgsmarker"
+  printf '%s\n' "$e2e_out" | sed 's/^/      /' >&2
+else
+  pass "Retry E2E (Issue #16): wiki_http wartet retry-after-auth (3s) ab und laeuft durch"
+fi
+
 # --- Ergebnis ---------------------------------------------------------------
 if [ "$FAILS" -gt 0 ]; then
   printf 'FAIL: %d Test(s) fehlgeschlagen\n' "$FAILS" >&2
