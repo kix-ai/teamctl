@@ -12,7 +12,7 @@ WIKI (Docmost)
     teamctl wiki get <pageId>
     teamctl wiki search <begriff>
     teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
-    teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend]
+    teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
     teamctl wiki upload <pageId> <bilddatei>
     teamctl wiki me
     teamctl wiki profile --name <name>
