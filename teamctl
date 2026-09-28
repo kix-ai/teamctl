@@ -262,6 +262,7 @@ WIKI (Docmost)
   teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
   teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
   teamctl wiki upload <pageId> <bilddatei>
+  teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
   teamctl wiki me
   teamctl wiki profile --name <name>
   (optional ueberall: --as <email|name>   Standard: writer)
@@ -562,6 +563,177 @@ wiki_profile() {
   printf 'OK\tName aktualisiert auf: %s\n' "$new_name"
 }
 
+
+# wiki_slugify <text> - Dateiname-taugliches Slug (ASCII, kleingeschrieben).
+wiki_slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -e 's/ä/ae/g; s/ö/oe/g; s/ü/ue/g; s/ß/ss/g' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
+    | cut -c1-80
+}
+
+# wiki_yaml_escape <text> - Backslash und Anfuehrungszeichen fuer YAML maskieren.
+wiki_yaml_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# wex_log <quiet> <text...> - Fortschritt auf stderr; mit --quiet unterdrueckt.
+wex_log() { local q="$1"; shift; [ "$q" -eq 1 ] || printf 'teamctl: %s\n' "$*" >&2; }
+
+# wiki_export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
+# Exportiert alle (oder mit --space nur die eines Spaces) Docmost-Seiten als
+# Markdown: eine Datei je Seite "<space-slug>__<page-slug>.md" mit YAML-Kopfzeile
+# (title, space, spaceId, pageId). Idempotent ueber ein Manifest
+# (.wiki-sync-manifest.tsv); im Wiki geloeschte Seiten werden aus dem Export
+# entfernt (ausser mit --no-prune). Es werden keine Secrets ausgegeben; die
+# Zugangsdaten stammen aus der teamctl-Konfiguration (TEAMCTL_WIKI_*).
+# Default-Ziel: WIKI_EXPORT_DIR, sonst ~/.openclaw/wiki.
+# Exit: 0 = vollstaendig, 1 = Fehler (unvollstaendig).
+wiki_export() {
+  local out="${WIKI_EXPORT_DIR:-$HOME/.openclaw/wiki}"
+  local only_space="" dry=0 prune=1 quiet=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --out)      [ $# -ge 2 ] || die "wiki export: --out braucht einen Wert"; out="$2"; shift 2 ;;
+    --space)    [ $# -ge 2 ] || die "wiki export: --space braucht einen Wert"; only_space="$2"; shift 2 ;;
+    --dry-run)  dry=1; shift ;;
+    --no-prune) prune=0; shift ;;
+    --quiet)    quiet=1; shift ;;
+    *) die "wiki export: unbekannte Option '$1'" ;;
+  esac; done
+
+  local sleep_s="${TEAMCTL_WIKI_EXPORT_SLEEP:-0.2}"
+  local manifest="$out/.wiki-sync-manifest.tsv"
+  local tmp_manifest pages_tmp one_tmp file_tmp
+  tmp_manifest="$(mktmp)"; pages_tmp="$(mktmp)"; one_tmp="$(mktmp)"; file_tmp="$(mktmp)"
+  : > "$tmp_manifest"; : > "$pages_tmp"
+
+  if [ "$dry" -eq 0 ]; then
+    mkdir -p "$out" 2>/dev/null || die "wiki export: Zielverzeichnis nicht beschreibbar: $out"
+  fi
+
+  wiki_login "$WIKI_AS"
+  wiki_api "spaces/" '{}' || die "wiki export: Spaces nicht lesbar (HTTP $WIKI_HTTP)"
+  local spaces_tsv
+  spaces_tsv="$(printf '%s' "$WIKI_BODY" | jq -r '.data.items[]? | [.id, (.slug // ""), (.name // "")] | @tsv' 2>/dev/null)"
+  [ -n "$spaces_tsv" ] || die "wiki export: keine Spaces sichtbar"
+
+  local n_spaces=0 n_pages=0 n_written=0 n_unchanged=0 n_removed=0 n_failed=0
+  local sid sslug sname items exp_slug=""
+
+  # 1) Seitenbaum aller Spaces abflachen -> spaceId<TAB>spaceSlug<TAB>pageId<TAB>title
+  while IFS=$'\t' read -r sid sslug sname; do
+    [ -n "$sid" ] || continue
+    [ -z "$sslug" ] && sslug="$(wiki_slugify "${sname:-space}")"
+    [ -z "$sslug" ] && sslug="$(wiki_slugify "$sid")"
+    [ -z "$sslug" ] && sslug="space"
+    if [ -n "$only_space" ] && [ "$sid" != "$only_space" ]; then continue; fi
+    n_spaces=$((n_spaces + 1))
+    exp_slug="$sslug"
+    if ! wiki_fetch_sidebar "$sid" ""; then
+      note "wiki export: Seitenbaum von Space '$sslug' nicht lesbar"
+      n_failed=$((n_failed + 1)); continue
+    fi
+    items="$(printf '%s' "$WIKI_BODY" | jq -c '.data.items' 2>/dev/null)"
+    wiki_collect_pages "$sid" "$sslug" "$items" > "$one_tmp"
+    while IFS=$'\t' read -r pslug pid ptitle; do
+      [ -n "${pid:-}" ] || continue
+      printf '%s\t%s\t%s\t%s\n' "$sid" "$pslug" "$pid" "$ptitle" >> "$pages_tmp"
+    done < "$one_tmp"
+    sleep "$sleep_s"
+  done <<< "$spaces_tsv"
+
+  if [ -n "$only_space" ] && [ "$n_spaces" -eq 0 ]; then
+    die "wiki export: Space '$only_space' nicht gefunden"
+  fi
+
+  # 2) Inhalte holen und Dateien idempotent schreiben.
+  local sid2 sslug2 pid ptitle pslug fname content body
+  while IFS=$'\t' read -r sid2 sslug2 pid ptitle; do
+    [ -n "${pid:-}" ] || continue
+    n_pages=$((n_pages + 1))
+    pslug="$(wiki_slugify "${ptitle:-page}")"; [ -z "$pslug" ] && pslug="page"
+    fname="${sslug2}__${pslug}.md"
+    if grep -qF "$fname"$'\t' "$tmp_manifest" 2>/dev/null; then
+      fname="${sslug2}__${pslug}-${pid:0:8}.md"
+    fi
+    body="$(jq -nc --arg p "$pid" '{pageId:$p, format:"markdown", includeContent:true}')"
+    if ! wiki_api "pages/info" "$body"; then
+      note "wiki export: Inhalt von '$ptitle' ($pid) nicht lesbar (HTTP $WIKI_HTTP)"
+      n_failed=$((n_failed + 1)); sleep "$sleep_s"; continue
+    fi
+    content="$(printf '%s' "$WIKI_BODY" | jq -r '.data.content // ""' 2>/dev/null)"
+
+    {
+      printf -- '---\n'
+      printf 'title: "%s"\n' "$(wiki_yaml_escape "$ptitle")"
+      printf 'space: "%s"\n' "$(wiki_yaml_escape "$sslug2")"
+      printf 'spaceId: "%s"\n' "$(wiki_yaml_escape "$sid2")"
+      printf 'pageId: "%s"\n' "$(wiki_yaml_escape "$pid")"
+      printf -- '---\n\n# %s\n\n%s\n' "$ptitle" "$content"
+    } > "$file_tmp"
+
+    if [ -f "$out/$fname" ] && cmp -s "$file_tmp" "$out/$fname"; then
+      n_unchanged=$((n_unchanged + 1))
+      printf '%s\t%s\t%s\t%s\n' "$fname" "$pid" "$sslug2" "$ptitle" >> "$tmp_manifest"
+    elif [ "$dry" -eq 1 ]; then
+      wex_log "$quiet" "  ~ $fname (dry-run)"
+      n_written=$((n_written + 1))
+      printf '%s\t%s\t%s\t%s\n' "$fname" "$pid" "$sslug2" "$ptitle" >> "$tmp_manifest"
+    elif mv "$file_tmp" "$out/$fname" 2>/dev/null; then
+      wex_log "$quiet" "  ~ $fname"
+      n_written=$((n_written + 1))
+      printf '%s\t%s\t%s\t%s\n' "$fname" "$pid" "$sslug2" "$ptitle" >> "$tmp_manifest"
+    else
+      note "wiki export: Datei nicht schreibbar: $fname"
+      n_failed=$((n_failed + 1))
+    fi
+    rm -f "$file_tmp"
+    sleep "$sleep_s"
+  done < "$pages_tmp"
+
+  # Bei --space die Manifest-Zeilen der anderen Spaces erhalten.
+  if [ "$dry" -eq 0 ] && [ -n "$only_space" ] && [ -f "$manifest" ]; then
+    awk -F'\t' -v s="$exp_slug" 'NF>=3 && $3!=s' "$manifest" >> "$tmp_manifest"
+  fi
+
+  # 3) Pruning: im Wiki geloeschte Seiten aus dem Export entfernen.
+  if [ "$prune" -eq 1 ] && [ -d "$out" ]; then
+    local base
+    while IFS= read -r f; do
+      base="$(basename "$f")"
+      case "$base" in .*) continue ;; esac
+      if [ -n "$only_space" ]; then
+        case "$base" in "${exp_slug}__"*) ;; *) continue ;; esac
+      fi
+      if ! grep -qF "$base"$'\t' "$tmp_manifest" 2>/dev/null; then
+        if [ "$dry" -eq 1 ]; then
+          wex_log "$quiet" "  - $base (dry-run)"
+        else
+          rm -f -- "$f" && wex_log "$quiet" "  - $base"
+        fi
+        n_removed=$((n_removed + 1))
+      fi
+    done < <(find "$out" -maxdepth 1 -type f -name '*.md' 2>/dev/null)
+  fi
+
+  # 4) Manifest atomar aktualisieren (nur bei echter Aenderung).
+  if [ "$dry" -eq 0 ]; then
+    if [ -f "$manifest" ] && cmp -s "$tmp_manifest" "$manifest"; then
+      :
+    else
+      mv "$tmp_manifest" "$manifest"
+    fi
+  fi
+
+  wex_log "$quiet" "wiki export: spaces=$n_spaces seiten=$n_pages geschrieben=$n_written unveraendert=$n_unchanged entfernt=$n_removed fehler=$n_failed"
+  wex_log "$quiet" "wiki export: ziel=$out"
+  if [ "$n_failed" -gt 0 ] || [ "$n_pages" -eq 0 ]; then
+    note "wiki export: FEHLGESCHLAGEN - $n_failed Fehler, $n_pages Seiten"
+    return 1
+  fi
+  return 0
+}
+
+
 wiki_cmd() {
   local args=() sub
   while [ $# -gt 0 ]; do
@@ -580,10 +752,11 @@ wiki_cmd() {
     create) wiki_create "$@" ;;
     update) wiki_update "$@" ;;
     upload) wiki_upload "$@" ;;
+    export) wiki_export "$@" ;;
     me) wiki_me "$@" ;;
     profile) wiki_profile "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "wiki: unbekannter Unterbefehl (spaces|pages|get|search|create|update|upload)" ;;
+    *) die "wiki: unbekannter Unterbefehl (spaces|pages|get|search|create|update|upload|export)" ;;
   esac
 }
 
