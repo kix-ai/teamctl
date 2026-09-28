@@ -403,6 +403,43 @@ else
   pass "Retry E2E (Issue #16): wiki_http wartet retry-after-auth (3s) ab und laeuft durch"
 fi
 
+# --- 8) git status: read-only Status eines lokalen Klons (kein Netz/Token) ---
+GSTAT="$WORK/gstat"
+mkdir -p "$GSTAT"
+git -C "$GSTAT" init -q -b main 2>/dev/null || git -C "$GSTAT" init -q 2>/dev/null
+git -C "$GSTAT" -c user.email=selftest@selftest.invalid -c user.name=selftest \
+  commit --allow-empty -qm 'init' 2>/dev/null
+printf 'x\n' > "$GSTAT/neu.txt"
+gout="$(PATH="$BIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_GITHUB_TOKEN_CMD='printf selftest-token' \
+  bash "$TEAMCTL" git status "$GSTAT" 2>&1)"
+grc=$?
+if [ "$grc" -ne 0 ]; then
+  fail "git status (positiv): Exit != 0 (war $grc)"
+  printf '%s\n' "$gout" | sed 's/^/      /' >&2
+else
+  fields="$(printf '%s\n' "$gout" | awk -F'\t' 'NF{print NF}')"
+  if [ "$fields" != "6" ]; then
+    fail "git status (Format): 6 TAB-Felder erwartet (waren $fields)"
+  else
+    pass "git status (Format): 6 TAB-Felder"
+  fi
+  unt="$(printf '%s\n' "$gout" | awk -F'\t' '{print $6}')"
+  chg="$(printf '%s\n' "$gout" | awk -F'\t' '{print $5}')"
+  if [ "$unt" = "1" ]; then pass "git status: untracked=1 erkannt"
+  else fail "git status: untracked erwartet 1 (war $unt)"; fi
+  if [ "$chg" = "1" ]; then pass "git status: changed=1 erkannt"
+  else fail "git status: changed erwartet 1 (war $chg)"; fi
+fi
+NGSTAT="$WORK/not-a-repo"; mkdir -p "$NGSTAT"
+gout2="$(PATH="$BIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_GITHUB_TOKEN_CMD='printf selftest-token' \
+  bash "$TEAMCTL" git status "$NGSTAT" 2>&1)"
+grc2=$?
+if [ "$grc2" -eq 0 ]; then
+  fail "git status (negativ): Exit != 0 erwartet, war 0"
+else
+  pass "git status (negativ): kein Repo -> Abbruch (Exit $grc2)"
+fi
+
 # --- Ergebnis ---------------------------------------------------------------
 if [ "$FAILS" -gt 0 ]; then
   printf 'FAIL: %d Test(s) fehlgeschlagen\n' "$FAILS" >&2
