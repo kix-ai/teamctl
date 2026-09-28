@@ -664,6 +664,167 @@ else
   fail "git upload mode (10e): rc=$e_rc, Ausgabe: $e_out"
 fi
 
+# --- 11) wiki update --parent: Umhaengen ueber pages/move (Issue #22) --------
+# --parent war wirkungslos, weil Docmost parentPageId in pages/update ignoriert.
+# Der Fix haengt per POST /api/pages/move um (position 5-12 Zeichen Pflicht)
+# und prueft das Ergebnis per pages/info (parentPageId). Der curl-Stub unten
+# emuliert die Seiten-API offline und protokolliert jede Anfrage in $WP_LOG.
+WP="$WORK/wpbin"
+mkdir -p "$WP"
+cat > "$WP/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub: emuliert die Docmost-Seiten-API (kein Netz). Protokoll je Anfrage:
+# <METHODE>\t<URL>\t<BODY> in $WP_LOG. Zustand: aktueller Parent in $WP_PARENT.
+method=POST; out=/dev/null; data=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    --data-binary) data="$2"; shift 2 ;;
+    -D|-H|--max-time|-w|-b|-c|-F) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\t%s\t%s\n' "$method" "$url" "$data" >> "$WP_LOG"
+ep="${url##*/api/}"
+code=200
+case "$ep" in
+  auth/login)
+    body='{"data":{"user":{"name":"selftest"}}}' ;;
+  pages/update)
+    printf '%s\n' "$data" >> "$WP_UPD"
+    body='{"success":true}' ;;
+  pages/sidebar-pages)
+    # Enthaelt die umzuhaengende Seite selbst (Selbstausschluss) und einen
+    # Nachbarn mit bekannter position.
+    body="$(jq -nc --arg p "$WP_PAGE" '{data:{items:[{id:"nb-1",title:"Nachbar",position:"a05FT",hasChildren:false},{id:$p,title:"selbst",position:"a163j",hasChildren:false}]}}')" ;;
+  pages/info)
+    parent="$(cat "$WP_PARENT" 2>/dev/null || true)"
+    body="$(jq -nc --arg p "$parent" --arg c "$WP_CONTENT" '{data:{id:"pg-1",spaceId:"sp-1",parentPageId:(if $p == "" then null else $p end),content:$c,title:"t"}}')" ;;
+  pages/move)
+    pos="$(printf '%s' "$data" | jq -r '.position // empty')"
+    if [ -n "$WP_MOVE_FAIL" ] || [ "${#pos}" -lt 5 ] || [ "${#pos}" -gt 12 ]; then
+      code=400
+      body='{"message":["position must be longer than or equal to 5 characters"]}'
+    else
+      if [ -z "$WP_MOVE_NOOP" ]; then
+        printf '%s' "$(printf '%s' "$data" | jq -r 'if .parentPageId == null then "" else .parentPageId end')" > "$WP_PARENT"
+      fi
+      body='{"success":true}'
+    fi ;;
+  *)
+    code=500
+    body='{"message":"stub: unhandled request"}' ;;
+esac
+printf '%s' "$body" > "$out"
+printf '%s' "$code"
+STUB
+chmod +x "$WP/curl"
+cat > "$WP/ssh" <<'STUB'
+#!/usr/bin/env bash
+# Stub: liefert ein Dummy-Passwort (kein Netzwerkzugriff).
+printf 'dummy\n'
+exit 0
+STUB
+chmod +x "$WP/ssh"
+
+WP_PAGE='pg-selftest'
+WP_FILE="$WORK/wp-content.md"
+printf 'PARENTMARKER1\n' > "$WP_FILE"
+WP_LOG="$WORK/wp.log"; WP_UPD="$WORK/wp.upd"; WP_PARENT="$WORK/wp.parent"
+WP_CONTENT='PARENTMARKER1'
+WP_KEY="$WORK/id_wp_dummy"; : > "$WP_KEY"
+
+wp_run() {  # $1 = Ziel-Parent ("" = Root); weitere Argumente werden angehaengt
+  local parent="$1"; shift
+  : > "$WP_LOG"; : > "$WP_UPD"
+  printf '%s' 'parent-old' > "$WP_PARENT"
+  PATH="$WP:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+    TEAMCTL_WIKI_AS='selftest@selftest.invalid' \
+    TEAMCTL_SSH_KEY="$WP_KEY" \
+    WP_LOG="$WP_LOG" WP_UPD="$WP_UPD" WP_PARENT="$WP_PARENT" WP_PAGE="$WP_PAGE" \
+    WP_CONTENT="$WP_CONTENT" WP_MOVE_FAIL="${WP_MOVE_FAIL:-}" WP_MOVE_NOOP="${WP_MOVE_NOOP:-}" \
+    bash "$TEAMCTL" wiki update "$WP_PAGE" --file "$WP_FILE" --parent "$parent" "$@"
+}
+
+# 11a) --parent <pageId>: move mit position, Read-back OK, Exit 0.
+mout="$(wp_run 'parent-new' 2>&1)"; mrc=$?
+mline="$(grep -F 'pages/move' "$WP_LOG" || true)"
+if [ "$mrc" -ne 0 ]; then
+  fail "wiki update --parent (Issue #22): Exit != 0 (war $mrc)"
+  printf '%s\n' "$mout" | sed 's/^/      /' >&2
+elif ! printf '%s' "$mline" | grep -q '"parentPageId":"parent-new"'; then
+  fail "wiki update --parent (Issue #22): pages/move nicht mit Ziel-Parent aufgerufen"
+elif ! printf '%s' "$mline" | grep -q '"position":"a05FTV"'; then
+  fail "wiki update --parent (Issue #22): position am Ende der Ziel-Liste fehlt/anders (erwartet a05FTV)"
+elif grep -q 'parentPageId' "$WP_UPD"; then
+  fail "wiki update --parent (Issue #22): pages/update sendet weiter parentPageId (wirkungslos)"
+else
+  pass "wiki update --parent (Issue #22): pages/move mit position a05FTV, Read-back OK, Exit 0"
+fi
+
+# 11b) --parent '' loest die Seite vom Parent (parentPageId:null, Read-back null).
+dout="$(wp_run '' 2>&1)"; drc=$?
+dline="$(grep -F 'pages/move' "$WP_LOG" || true)"
+if [ "$drc" -ne 0 ]; then
+  fail "wiki update --parent \'\' (Issue #22): Exit != 0 (war $drc)"
+  printf '%s\n' "$dout" | sed 's/^/      /' >&2
+elif ! printf '%s' "$dline" | grep -q '"parentPageId":null'; then
+  fail "wiki update --parent \'\' (Issue #22): move ohne parentPageId:null"
+elif ! printf '%s' "$dline" | grep -qE '"position":"[A-Za-z0-9]{5,12}"'; then
+  fail "wiki update --parent \'\' (Issue #22): position fehlt/ungueltig"
+elif [ -n "$(cat "$WP_PARENT" 2>/dev/null)" ]; then
+  fail "wiki update --parent \'\' (Issue #22): Read-back nicht auf Root geloest"
+else
+  pass "wiki update --parent \'\' (Issue #22): vom Parent geloest, Read-back null, Exit 0"
+fi
+
+# 11c) Read-back-Schutz: ignorierter move (Parent bleibt alt) -> Abbruch.
+WP_MOVE_NOOP=1
+vout="$(wp_run 'parent-new' 2>&1)"; vrc=$?
+WP_MOVE_NOOP=
+if [ "$vrc" -eq 0 ]; then
+  fail "wiki update --parent (Read-back, Issue #22): Exit 0 trotz unveraendertem Parent"
+elif ! printf '%s' "$vout" | grep -q 'Verifikation'; then
+  fail "wiki update --parent (Read-back, Issue #22): keine Verifikationsmeldung"
+  printf '%s\n' "$vout" | sed 's/^/      /' >&2
+else
+  pass "wiki update --parent (Read-back, Issue #22): parentPageId-Mismatch -> Abbruch (Exit $vrc)"
+fi
+
+# 11d) move abgelehnt (HTTP 400 zur position) -> klare Meldung, Exit != 0.
+WP_MOVE_FAIL=1
+fout="$(wp_run 'parent-new' 2>&1)"; frc=$?
+WP_MOVE_FAIL=
+if [ "$frc" -eq 0 ]; then
+  fail "wiki update --parent (Abweisung, Issue #22): Exit 0 trotz HTTP 400"
+elif ! printf '%s' "$fout" | grep -q 'Umhaengen fehlgeschlagen'; then
+  fail "wiki update --parent (Abweisung, Issue #22): keine klare Meldung"
+  printf '%s\n' "$fout" | sed 's/^/      /' >&2
+else
+  pass "wiki update --parent (Abweisung, Issue #22): HTTP 400 -> klare Meldung, Exit $frc"
+fi
+
+# 11e) Ohne --parent wird KEIN move gesendet (kein Nebeneffekt).
+: > "$WP_LOG"; : > "$WP_UPD"; printf '%s' 'parent-old' > "$WP_PARENT"
+nout="$(PATH="$WP:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+  TEAMCTL_WIKI_AS='selftest@selftest.invalid' \
+  TEAMCTL_SSH_KEY="$WP_KEY" \
+  WP_LOG="$WP_LOG" WP_UPD="$WP_UPD" WP_PARENT="$WP_PARENT" WP_PAGE="$WP_PAGE" \
+  WP_CONTENT="$WP_CONTENT" \
+  bash "$TEAMCTL" wiki update "$WP_PAGE" --file "$WP_FILE" 2>&1)"; nrc=$?
+if [ "$nrc" -ne 0 ]; then
+  fail "wiki update ohne --parent (Issue #22): Exit != 0 (war $nrc)"
+  printf '%s\n' "$nout" | sed 's/^/      /' >&2
+elif grep -q 'pages/move' "$WP_LOG"; then
+  fail "wiki update ohne --parent (Issue #22): unerwarteter move-Aufruf"
+elif grep -q 'parentPageId' "$WP_UPD"; then
+  fail "wiki update ohne --parent (Issue #22): pages/update sendet parentPageId"
+else
+  pass "wiki update ohne --parent (Issue #22): kein move, pages/update ohne parentPageId"
+fi
+
 # --- Ergebnis ---------------------------------------------------------------
 if [ "$FAILS" -gt 0 ]; then
   printf 'FAIL: %d Test(s) fehlgeschlagen\n' "$FAILS" >&2
