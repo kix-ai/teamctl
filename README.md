@@ -88,6 +88,7 @@ WIKI (Docmost)
     teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
     teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>]
     teamctl wiki upload <pageId> <bilddatei>
+    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
     (optional ueberall: --as <email|name>)
     (wiki update: --parent '' loest die Seite vom Parent)
 
@@ -141,6 +142,45 @@ ein Issue traegt im Titel das Praefix `[<agent-id>]` und beginnt im Body mit
 
 Ohne die neuen Flags bleiben Titel und Body unveraendert; die Pruefung aendert die
 stdout-Ausgabe nicht (Hinweise gehen ausschliesslich auf stderr).
+
+## Wiki-Export fuer die Memory-Suche: `teamctl wiki export`
+
+`teamctl wiki export` exportiert **alle** Docmost-Seiten **aller** Spaces als
+Markdown in ein Zielverzeichnis und haelt es idempotent aktuell. Der Export wird
+von der Memory-Suche der Agents (`memory_search`) als zusaetzlicher Pfad
+indiziert; so ist das Wiki durchsuchbar, ohne jede Seite in den Kontext zu laden.
+
+- Quelle: Docmost-API (`auth/login` + `spaces/` + `pages/sidebar-pages` +
+  `pages/info`), **seriell** mit einem Login je Lauf (Cookie wiederverwendet)
+  und Wiederholung bei HTTP 429 (Retry-After/Backoff).
+- Zugangsdaten: wie `teamctl` aus `teamctl.env` (`TEAMCTL_WIKI_*`); sie werden
+  nie ausgegeben und stehen nicht in den Export-Dateien.
+- Ziel: eine Markdown-Datei pro Seite, `<space-slug>__<page-slug>.md`, mit
+  YAML-Kopfzeile (`title`, `space`, `spaceId`, `pageId`) und dem Seiteninhalt.
+- Idempotent: unveraenderte Seiten werden nicht angefasst; im Wiki geloeschte
+  Seiten werden per Manifest (`.wiki-sync-manifest.tsv`) aus dem Ziel entfernt
+  (ausser mit `--no-prune`).
+- Exit 0 = vollstaendiger Export, 1 = Fehler (unvollstaendig).
+
+    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
+
+| Option | Bedeutung |
+| --- | --- |
+| `--out DIR` | Zielverzeichnis (Default: `WIKI_EXPORT_DIR`, sonst `~/.openclaw/wiki`) |
+| `--space <spaceId>` | nur diesen Space exportieren (andere Spaces bleiben unberuehrt) |
+| `--dry-run` | nur zeigen, was sich aendern wuerde (keine Schreibzugriffe) |
+| `--no-prune` | im Wiki geloeschte Seiten im Ziel belassen |
+| `--quiet` | Fortschrittsausgabe unterdruecken (Fehler bleiben sichtbar) |
+
+| Variable | Default | Bedeutung |
+| --- | --- | --- |
+| `WIKI_EXPORT_DIR` | `~/.openclaw/wiki` | Zielverzeichnis, wenn `--out` fehlt |
+| `TEAMCTL_WIKI_EXPORT_SLEEP` | `0.2` | Pause zwischen API-Aufrufen (429-Schutz), Sekunden |
+
+Ist das Default-Ziel nicht beschreibbar, `WIKI_EXPORT_DIR` in `teamctl.env` auf
+einen beschreibbaren Pfad setzen. Derselbe Pfad muss in der
+OpenClaw-Konfiguration unter `memory.search.extraPaths` stehen.
+
 
 ## Ausgabe und Fehler
 
