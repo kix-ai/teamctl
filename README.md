@@ -109,6 +109,7 @@ GIT (GitHub, Konto per Token)
     teamctl git read <repo> <pfad> [--ref <branch>]      (Alias: git cat)
     teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
     teamctl git pull <dir>
+    teamctl git status <dir>
     teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
                       [--author <agent-id>] [--require-author]
     teamctl git issue-close <repo> <nummer>
