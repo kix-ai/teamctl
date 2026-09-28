@@ -114,6 +114,10 @@ GIT (GitHub, Konto per Token)
     teamctl git issues <repo> [--state open|closed|all] [--label <l>]
     teamctl git issues-all [--state open|closed|all] [--label <l>]
 
+DIAGNOSE (read-only)
+
+    teamctl doctor
+
 `teamctl help` zeigt die Kurzuebersicht, `teamctl wiki|blog|git --help`
 die jeweiligen Unterbefehle.
 
@@ -149,6 +153,36 @@ stdout-Ausgabe nicht (Hinweise gehen ausschliesslich auf stderr).
   Backoff mit Jitter, `Retry-After` wird beachtet).
 - Alle Schreibbefehle machen einen Read-back und schlagen fehl, wenn das Ergebnis
   nicht bestaetigt werden kann.
+
+## Selbstdiagnose: `teamctl doctor`
+
+`teamctl doctor` ist ein **read-only** Selbsttest: er prueft lokale Werkzeuge,
+Konfiguration und Erreichbarkeit von Wiki- und GitHub-API, ohne Daten zu
+aendern. Der Befehl laeuft **vor** der Pflichtwert-Pruefung - eine
+unvollstaendige oder fehlerhafte Konfiguration wird also als `FAIL`-Zeile
+gemeldet statt mit einem Abbruch beendet.
+
+Ausgabe: je Pruefung eine TAB-getrennte Zeile
+`<pruefung>\t<OK|WARN|FAIL>\t<detail>`. Das Detail nennt ausschliesslich
+Schluesselnamen, Status und HTTP-Codes - niemals Werte (keine URL, kein Host,
+kein Token, kein Pfad-Inhalt, keine E-Mail).
+
+| Pruefung | Inhalt |
+| --- | --- |
+| `deps` | `jq` und `curl` vorhanden; `openssl` nur bei gesetztem `TEAMCTL_WIKI_CA` |
+| `config` | Pflichtwerte gesetzt und `https://` fuer `TEAMCTL_GIT_API`/`TEAMCTL_WIKI_URL` |
+| `wiki-ca` | Datei zu `TEAMCTL_WIKI_CA` (nur wenn gesetzt): vorhanden, regulaer, lesbar, nicht leer, PEM, per `openssl` lesbar |
+| `wiki-api` | Wiki-Login und `POST /api/spaces/` (OK bei HTTP 200) |
+| `git-token` | Token ueber `TEAMCTL_GITHUB_TOKEN_CMD` lesbar und nicht leer |
+| `git-api` | `GET /user` (OK bei HTTP 200) |
+| `ssh-key` | Datei `TEAMCTL_SSH_KEY` vorhanden (sonst `WARN`, kein Abbruch) |
+
+Exit-Code: `0`, wenn keine Pruefung `FAIL` ist (ein `WARN` allein ergibt `0`);
+`1`, wenn mindestens eine Pruefung `FAIL` ist.
+
+```bash
+teamctl doctor
+```
 
 ## Sicherheit
 
