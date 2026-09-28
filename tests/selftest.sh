@@ -529,6 +529,141 @@ case "$ws_err2" in
   *) fail "wiki search (Issue #20): fehlender Export -> kein Hinweis (stderr: $ws_err2)" ;;
 esac
 
+# --- 10) git upload: Executable-Bit (mode 100755) bleibt erhalten ----------
+# Regression zum Fehlerbild "mode change 100755 => 100644": die Contents-API
+# speichert regulaere Dateien immer als 100644. Fuer ausfuehrbare lokale
+# Dateien muss git upload daher die Git-Data-API nutzen (blob -> tree mit
+# mode 100755 -> commit -> ref). Der curl-Stub emuliert die GitHub-API
+# vollstaendig offline; jede Anfrage wird in $UP_LOG protokolliert.
+GUPBIN="$WORK/gupbin"
+mkdir -p "$GUPBIN"
+cat > "$GUPBIN/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub: emuliert die GitHub-API (kein Netz). Protokollzeile:
+# <METHODE>\t<URL>\t<BODY>
+method=GET; out=/dev/null; data=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    --data-binary) data="$2"; shift 2 ;;
+    -H|--max-time|-w) shift 2 ;;
+    -sS|-s|-S) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\t%s\t%s\n' "$method" "$url" "$data" >> "$UP_LOG"
+tpath="$url"; tpath="$(printf '%s' "$tpath" | sed 's#.*/contents/##')"
+tmode="$UP_TREE_MODE"; [ -n "$tmode" ] || tmode=100755
+body=""; code=200
+case "$method $url" in
+  "GET "*"/repos/selftest-owner/selftest-repo")
+    body='{"default_branch":"main"}' ;;
+  "GET "*"/git/ref/heads/main")
+    body='{"object":{"sha":"head1"}}' ;;
+  "GET "*"/git/commits/head1")
+    body='{"tree":{"sha":"basetree1"}}' ;;
+  "GET "*"/git/trees/commit1?recursive=1")
+    body="$(jq -nc --arg p "$UP_PATH" --arg m "$tmode" '{tree:[{path:$p,mode:$m,sha:"blob1"}]}')" ;;
+  "POST "*"/git/blobs")
+    body='{"sha":"blob1"}'; code=201 ;;
+  "POST "*"/git/trees")
+    body='{"sha":"tree1"}'; code=201 ;;
+  "POST "*"/git/commits")
+    body='{"sha":"commit1"}'; code=201 ;;
+  "PATCH "*"/git/refs/heads/main")
+    body='{}' ;;
+  "PUT "*)
+    printf '%s' "$data" | jq -r '.content' | base64 -d | wc -c | tr -d '[:space:]' > "$UP_STATE"
+    body='{"content":{"sha":"put1"}}'; code=201 ;;
+  "GET "*)
+    if [ -s "$UP_STATE" ]; then
+      body="$(jq -nc --argjson s "$(cat "$UP_STATE")" '{sha:"put1",size:$s}')"
+    else
+      body='{"message":"Not Found"}'; code=404
+    fi ;;
+  *)
+    body='{"message":"stub: unhandled request"}'; code=500 ;;
+esac
+printf '%s' "$body" > "$out"
+printf '%s' "$code"
+STUB
+chmod +x "$GUPBIN/curl"
+
+guprun() {
+  local state="$1" log="$2" p="$3" tmode="$4" file="$5"; shift 5
+  : > "$log"; : > "$state"
+  PATH="$GUPBIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+    TEAMCTL_GITHUB_TOKEN_CMD='printf selftest-token' \
+    UP_LOG="$log" UP_STATE="$state" UP_PATH="$p" UP_TREE_MODE="$tmode" \
+    bash "$TEAMCTL" git upload selftest-repo "$p" "$file" "$@"
+}
+
+# 10a) ausfuehrbare Datei -> Git-Data-API, Tree-Eintrag mode 100755.
+GUP_A="$WORK/gup-a"; mkdir -p "$GUP_A"
+printf '#!/bin/sh\necho hallo\n' > "$GUP_A/x.sh"; chmod +x "$GUP_A/x.sh"
+a_out="$(guprun "$GUP_A/state" "$GUP_A/log" x.sh 100755 "$GUP_A/x.sh" 2>&1)"; a_rc=$?
+if [ "$a_rc" -ne 0 ]; then
+  fail "git upload mode (10a): Exit != 0 (war $a_rc)"
+  printf '%s\n' "$a_out" | sed 's/^/      /' >&2
+else
+  pass "git upload mode (10a): ausfuehrbare Datei -> Exit 0"
+fi
+if grep -q '/git/blobs' "$GUP_A/log" && grep -q '"mode":"100755"' "$GUP_A/log" \
+   && grep -q 'PATCH' "$GUP_A/log"; then
+  pass "git upload mode (10a): blob -> tree(mode 100755) -> ref"
+else
+  fail "git upload mode (10a): Data-API-Kette/Tree-Mode fehlt"
+fi
+if grep -q '/contents/' "$GUP_A/log"; then
+  fail "git upload mode (10a): Contents-API trotz Executable genutzt"
+else
+  pass "git upload mode (10a): keine Contents-API fuer ausfuehrbare Datei"
+fi
+
+# 10b) nicht ausfuehrbare Datei -> Contents-API (Altverhalten, mode 100644).
+GUP_B="$WORK/gup-b"; mkdir -p "$GUP_B"
+printf 'plain content\n' > "$GUP_B/y.sh"
+b_out="$(guprun "$GUP_B/state" "$GUP_B/log" y.sh 100755 "$GUP_B/y.sh" 2>&1)"; b_rc=$?
+if [ "$b_rc" -eq 0 ] && grep -q '/contents/y.sh' "$GUP_B/log" \
+   && ! grep -q '/git/blobs' "$GUP_B/log"; then
+  pass "git upload mode (10b): nicht ausfuehrbar -> Contents-API"
+else
+  fail "git upload mode (10b): rc=$b_rc, Log: $(tr '\n' '|' < "$GUP_B/log")"
+fi
+
+# 10c) --no-exec erzwingt die Contents-API auch bei lokalem +x.
+GUP_C="$WORK/gup-c"; mkdir -p "$GUP_C"
+printf 'x\n' > "$GUP_C/z.sh"; chmod +x "$GUP_C/z.sh"
+c_out="$(guprun "$GUP_C/state" "$GUP_C/log" z.sh 100755 "$GUP_C/z.sh" --no-exec 2>&1)"; c_rc=$?
+if [ "$c_rc" -eq 0 ] && grep -q '/contents/z.sh' "$GUP_C/log" \
+   && ! grep -q '/git/blobs' "$GUP_C/log"; then
+  pass "git upload mode (10c): --no-exec -> Contents-API"
+else
+  fail "git upload mode (10c): rc=$c_rc, Log: $(tr '\n' '|' < "$GUP_C/log")"
+fi
+
+# 10d) --exec erzwingt die Git-Data-API auch ohne lokales +x.
+GUP_D="$WORK/gup-d"; mkdir -p "$GUP_D"
+printf 'plain\n' > "$GUP_D/w.sh"
+d_out="$(guprun "$GUP_D/state" "$GUP_D/log" w.sh 100755 "$GUP_D/w.sh" --exec 2>&1)"; d_rc=$?
+if [ "$d_rc" -eq 0 ] && grep -q '"mode":"100755"' "$GUP_D/log" \
+   && ! grep -q '/contents/' "$GUP_D/log"; then
+  pass "git upload mode (10d): --exec -> Git-Data-API (mode 100755)"
+else
+  fail "git upload mode (10d): rc=$d_rc, Log: $(tr '\n' '|' < "$GUP_D/log")"
+fi
+
+# 10e) Verifikation: falscher Mode im Read-back -> Abbruch (Exit != 0).
+GUP_E="$WORK/gup-e"; mkdir -p "$GUP_E"
+printf 'y\n' > "$GUP_E/v.sh"; chmod +x "$GUP_E/v.sh"
+e_out="$(guprun "$GUP_E/state" "$GUP_E/log" v.sh 100644 "$GUP_E/v.sh" 2>&1)"; e_rc=$?
+if [ "$e_rc" -ne 0 ] && printf '%s' "$e_out" | grep -q 'Verifikation'; then
+  pass "git upload mode (10e): Read-back-Mode-Abweichung -> Abbruch"
+else
+  fail "git upload mode (10e): rc=$e_rc, Ausgabe: $e_out"
+fi
+
 # --- Ergebnis ---------------------------------------------------------------
 if [ "$FAILS" -gt 0 ]; then
   printf 'FAIL: %d Test(s) fehlgeschlagen\n' "$FAILS" >&2
