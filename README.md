@@ -106,7 +106,7 @@ GIT (GitHub, Konto per Token)
     teamctl git repos
     teamctl git list <repo> [dir]
     teamctl git create-repo <name> [--public]
-    teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>]
+    teamctl git upload <repo> <pfad> <lokale-datei> [--message <m>] [--exec|--no-exec]
     teamctl git read <repo> <pfad> [--ref <branch>]      (Alias: git cat)
     teamctl git clone <repo> [--dir <ziel>] [--branch <b>]
     teamctl git pull <dir>
@@ -123,6 +123,21 @@ DIAGNOSE (read-only)
 
 `teamctl help` zeigt die Kurzuebersicht, `teamctl wiki|blog|git --help`
 die jeweiligen Unterbefehle.
+
+### Executable-Bit bei `git upload`
+
+`teamctl git upload` erhaelt das Executable-Bit:
+
+- Ist die lokale Datei ausfuehrbar (mode `+x`), schreibt teamctl sie ueber die
+  Git-Data-API (blob -> tree mit mode `100755` -> commit -> ref) - der
+  Executable-Bit bleibt erhalten.
+- Sonst nutzt teamctl die Contents-API (mode `100644`, unveraendertes
+  Altverhalten). `--exec` erzwingt `100755`, `--no-exec` erzwingt `100644`.
+- Grund: die Contents-API speichert regulaere Dateien immer als `100644`;
+  ein Executable-Bit laesst sich damit nicht setzen. Fehlerbild sonst:
+  `mode change 100755 => 100644` beim Checkout.
+- Read-back: nach dem Schreiben prueft teamctl Mode und Blob-SHA im Tree des
+  neuen Commits; bei Abweichung bricht `git upload` mit Exit ungleich 0 ab.
 
 ### Ersteller-Kennung bei `git issue`
 
