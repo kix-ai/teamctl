@@ -295,6 +295,8 @@ WIKI (Docmost)
   teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>|--parent '']
   teamctl wiki upload <pageId> <bilddatei>
   teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
+  teamctl wiki integrity [--space <spaceId>] [--export-dir DIR] [--no-export]
+                         [--fix-parent <pageId|''>] [--dry-run]   (Alias: wiki orphans)
   teamctl wiki me
   teamctl wiki profile --name <name>
   (optional ueberall: --as <email|name>   Standard: writer)
@@ -344,6 +346,12 @@ Hinweis:
   'teamctl wiki export'); ohne Export folgt ein Hinweis + titelbasierter
   API-Fallback. --title sucht nur Titel ueber die API, --export-dir DIR
   waehlt ein anderes Exportverzeichnis.
+  teamctl wiki integrity findet Seiten, die in KEINEM Sidebar-Baum haengen
+  (Orphans: Navigation/Suche/Export unerreichbar), und meldet je Befund
+  <spaceSlug><TAB><pageId><TAB><title><TAB><gruende> mit gruenden aus
+  not-in-tree, dangling-parent, cross-space-parent, no-export. --fix-parent
+  <pageId> haengt die not-in-tree-Seiten um (pages/move + Read-back),
+  --dry-run zeigt das nur an. Exit 1 = Befunde bzw. fehlgeschlagene Reparatur.
   teamctl wiki update --parent <pageId> haengt eine bestehende Seite um
   (pages/move + Read-back); --parent '' loest sie vom Parent auf Root. Ohne
   --parent bleibt der Parent unveraendert.
@@ -1018,6 +1026,232 @@ wiki_export() {
   return 0
 }
 
+# ---------------- Wiki: Integritaet (Orphans / verwaiste Seiten) ----------
+# Hintergrund: Docmost zeigt im Sidebar-Baum nur Seiten, die ueber parentPageId
+# erreichbar sind (Wurzel: parentPageId is null im jeweiligen Space). Seiten,
+# deren Parent geloescht wurde (Soft-Delete) oder in einem anderen Space liegt,
+# haengen in KEINEM Baum - sie fehlen damit in Navigation, Volltextsuche
+# (Export) und Export. Diese Integritaets-Luecke deckt 'wiki integrity' auf.
+
+# wiki_all_pages [<spaceId>]
+# Listet ALLE nicht geloeschten Seiten ueber die cursor-paginierte Docmost-API
+# 'pages/recent' - unabhaengig von der Baum-Erreichbarkeit. Ausgabe je Zeile:
+# spaceId<TAB>pageId<TAB>title<TAB>parentPageId (parentPageId leer = Root).
+# Blaettert per meta.nextCursor; begrenzt auf TEAMCTL_WIKI_INTEGRITY_MAXPAGES
+# (Default 2000) gegen Endlosschleifen. Nur lesend.
+wiki_all_pages() {
+  local only_space="${1:-}"
+  local limit="${TEAMCTL_WIKI_INTEGRITY_PAGE_LIMIT:-100}"
+  local max_pages="${TEAMCTL_WIKI_INTEGRITY_MAXPAGES:-2000}"
+  local sleep_s="${TEAMCTL_WIKI_INTEGRITY_SLEEP:-0.2}"
+  local cursor="" body n total=0
+  case "$limit" in ''|*[!0-9]*) die "wiki integrity: TEAMCTL_WIKI_INTEGRITY_PAGE_LIMIT ist keine Zahl" ;; esac
+  { [ "$limit" -ge 1 ] && [ "$limit" -le 100 ]; } \
+    || die "wiki integrity: TEAMCTL_WIKI_INTEGRITY_PAGE_LIMIT muss zwischen 1 und 100 liegen (Docmost-Grenze)"
+  case "$max_pages" in ''|*[!0-9]*) die "wiki integrity: TEAMCTL_WIKI_INTEGRITY_MAXPAGES ist keine Zahl" ;; esac
+  while :; do
+    if [ -n "$only_space" ]; then
+      body="$(jq -nc --arg s "$only_space" --argjson l "$limit" --arg c "$cursor" \
+        '{spaceId:$s,limit:$l} + (if $c=="" then {} else {cursor:$c} end)')"
+    else
+      body="$(jq -nc --argjson l "$limit" --arg c "$cursor" \
+        '{limit:$l} + (if $c=="" then {} else {cursor:$c} end)')"
+    fi
+    wiki_api "pages/recent" "$body" \
+      || die "wiki integrity: Seitenliste nicht lesbar (HTTP $WIKI_HTTP bei POST /api/pages/recent)"
+    printf '%s' "$WIKI_BODY" | jq -e '.data.items | type=="array"' >/dev/null 2>&1 \
+      || die "wiki integrity: unerwartete API-Antwort auf pages/recent"
+    n="$(printf '%s' "$WIKI_BODY" | jq -r '.data.items | length')"
+    printf '%s' "$WIKI_BODY" \
+      | jq -r '.data.items[]? | [(.spaceId // ""), (.id // ""), (.title // ""), (.parentPageId // "")] | @tsv'
+    total=$((total + n))
+    [ "$total" -le "$max_pages" ] \
+      || die "wiki integrity: mehr als $max_pages Seiten gelesen - Abbruch (TEAMCTL_WIKI_INTEGRITY_MAXPAGES erhoehen)"
+    [ "$n" -gt 0 ] || break
+    printf '%s' "$WIKI_BODY" | jq -e '.data.meta.hasNextPage == true' >/dev/null 2>&1 || break
+    cursor="$(printf '%s' "$WIKI_BODY" | jq -r '.data.meta.nextCursor // empty')"
+    [ -n "$cursor" ] || break
+    sleep "$sleep_s"
+  done
+}
+
+# wiki_export_ids <dir>
+# Liest die Seiten-IDs des lokalen Exports. Quelle ist bevorzugt das Manifest
+# (.wiki-sync-manifest.tsv: fname<TAB>pageId<TAB>spaceSlug<TAB>title), sonst
+# die YAML-Kopfzeile (pageId) der Export-Dateien. Ausgabe: je Zeile eine ID.
+wiki_export_ids() {
+  local dir="$1"
+  if [ -f "$dir/.wiki-sync-manifest.tsv" ]; then
+    awk -F'\t' 'NF>=2 && $2!="" { print $2 }' "$dir/.wiki-sync-manifest.tsv"
+  else
+    grep -h '^pageId:' "$dir"/*.md 2>/dev/null \
+      | sed -e 's/^pageId:[[:space:]]*//' -e 's/"//g' \
+      | awk 'NF>0'
+  fi
+}
+
+# wiki_integrity [--space <spaceId>] [--export-dir DIR] [--no-export]
+#                [--fix-parent <pageId|''>] [--dry-run] [--as <email|name>]
+# Prueft den Wiki-Baum auf verwaiste (nicht erreichbare) Seiten und meldet je
+# Befund eine Zeile nach stdout:
+#   <spaceSlug><TAB><pageId><TAB><title><TAB><gruende>
+# gruende ist eine Komma-Liste:
+#   not-in-tree         Seite haengt in KEINEM Sidebar-Baum (Navigation/Suche/
+#                       Export unerreichbar) - der Kern-Orphan.
+#   dangling-parent     parentPageId zeigt auf eine nicht (mehr) existierende
+#                       Seite (z. B. nach Soft-Delete des Parents).
+#   cross-space-parent  parentPageId zeigt auf eine Seite in einem ANDEREN Space.
+#   no-export           Seite fehlt im lokalen Export (nur wenn ein Export
+#                       gefunden wurde; --no-export schaltet die Pruefung ab).
+#
+# Optionen:
+#   --space <spaceId>   beschraenkt Baum UND Seitentabelle auf einen Space.
+#   --export-dir DIR    Exportverzeichnis (Default: WIKI_EXPORT_DIR oder
+#                       ~/.openclaw/wiki, wie bei 'wiki search').
+#   --no-export         keine Export-Pruefung.
+#   --fix-parent <id>   haengt die gefundenen not-in-tree-Seiten an <id> um
+#                       (pages/move + Read-back); '' loest sie auf Root.
+#   --dry-run           zeigt bei --fix-parent nur an, was passieren wuerde.
+# Exit: 0 = keine offenen Befunde, 1 = Befunde bzw. fehlgeschlagene Reparatur.
+wiki_integrity() {
+  local only_space="" exp_dir="${WIKI_EXPORT_DIR:-$HOME/.openclaw/wiki}" exp_given=0
+  local do_export=1 fix_parent="" fix_set=0 dry=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --space)      [ $# -ge 2 ] || die "wiki integrity: --space braucht einen Wert"; only_space="$2"; shift 2 ;;
+    --export-dir) [ $# -ge 2 ] || die "wiki integrity: --export-dir braucht einen Wert"; exp_dir="$2"; exp_given=1; shift 2 ;;
+    --no-export)  do_export=0; shift ;;
+    --fix-parent) [ $# -ge 2 ] || die "wiki integrity: --fix-parent braucht einen Wert"; fix_parent="$2"; fix_set=1; shift 2 ;;
+    --dry-run)    dry=1; shift ;;
+    --as)         [ $# -ge 2 ] || die "wiki integrity: --as braucht einen Wert"; WIKI_AS="$2"; shift 2 ;;
+    *) die "wiki integrity: unbekannte Option '$1'" ;;
+  esac; done
+
+  wiki_login "$WIKI_AS"
+  wiki_api_or_die "spaces/" '{}' || die "wiki integrity: Spaces nicht lesbar (HTTP $WIKI_HTTP)"
+  local spaces_tsv
+  spaces_tsv="$(printf '%s' "$WIKI_BODY" | jq -r '.data.items[]? | [.id, (.slug // ""), (.name // "")] | @tsv' 2>/dev/null)"
+  [ -n "$spaces_tsv" ] || die "wiki integrity: keine Spaces sichtbar"
+
+  local slug_file tree_file all_file all2_file exp_file
+  slug_file="$(mktmp)"; tree_file="$(mktmp)"; all_file="$(mktmp)"
+  all2_file="$(mktmp)"; exp_file="$(mktmp)"
+  TMPFILES+=("$slug_file" "$tree_file" "$all_file" "$all2_file" "$exp_file")
+  : > "$slug_file"; : > "$tree_file"; : > "$all_file"; : > "$all2_file"; : > "$exp_file"
+
+  # 1) Sidebar-Baum je Space -> erreichbare Seiten (pageId<TAB>spaceSlug).
+  local sid slug sname items n_spaces=0
+  while IFS=$'\t' read -r sid slug sname; do
+    [ -n "$sid" ] || continue
+    [ -n "$slug" ] || slug="$(wiki_slugify "${sname:-space}")"
+    [ -n "$slug" ] || slug="$(wiki_slugify "$sid")"
+    [ -n "$slug" ] || slug="space"
+    if [ -n "$only_space" ] && [ "$sid" != "$only_space" ]; then continue; fi
+    n_spaces=$((n_spaces + 1))
+    printf '%s\t%s\n' "$sid" "$slug" >> "$slug_file"
+    if ! wiki_fetch_sidebar "$sid" ""; then
+      note "wiki integrity: Seitenbaum von Space '$slug' nicht lesbar - uebersprungen"
+      continue
+    fi
+    items="$(printf '%s' "$WIKI_BODY" | jq -c '.data.items' 2>/dev/null)"
+    # wiki_collect_pages liefert slug<TAB>pageId<TAB>title -> pageId<TAB>slug
+    wiki_collect_pages "$sid" "$slug" "$items" \
+      | awk -F'\t' 'NF>=2 && $2!="" { printf "%s\t%s\n", $2, $1 }' >> "$tree_file"
+    sleep "${TEAMCTL_WIKI_INTEGRITY_SLEEP:-0.2}"
+  done <<< "$spaces_tsv"
+
+  if [ -n "$only_space" ] && [ "$n_spaces" -eq 0 ]; then
+    die "wiki integrity: Space '$only_space' nicht gefunden"
+  fi
+
+  # 2) ALLE Seiten (unabhaengig vom Baum) -> Bewertungsgrundlage.
+  wiki_all_pages "$only_space" >> "$all_file"
+  local n_total n_tree
+  n_total="$(wc -l < "$all_file" | tr -d ' ')"
+  n_tree="$(wc -l < "$tree_file" | tr -d ' ')"
+  # Kopie, damit awk die Seitentabelle in zwei Durchlaeufen lesen kann
+  # (Durchlauf 1: Nachschlagewerke, Durchlauf 2: Bewertung) - mawk-kompatibel.
+  cp -- "$all_file" "$all2_file"
+
+  # 3) Export-Menge (optional).
+  local exp_avail=0
+  if [ "$do_export" -eq 1 ]; then
+    if [ -d "$exp_dir" ] && { [ -f "$exp_dir/.wiki-sync-manifest.tsv" ] || [ -n "$(find "$exp_dir" -maxdepth 1 -type f -name '*.md' -print -quit 2>/dev/null)" ]; }; then
+      wiki_export_ids "$exp_dir" | awk 'NF>0' | sort -u > "$exp_file"
+      exp_avail=1
+    elif [ "$exp_given" -eq 1 ]; then
+      die "wiki integrity: kein Export in '$exp_dir' gefunden (--export-dir)"
+    else
+      note "wiki integrity: kein Wiki-Export in '$exp_dir' gefunden - Export-Pruefung uebersprungen (--export-dir DIR fuer einen anderen Pfad)"
+    fi
+  fi
+
+  # 4) Bewerten: Baum-Menge und Seitentabelle gegeneinander pruefen.
+  local findings
+  findings="$(awk -F'\t' -v OFS='\t' \
+    -v f_slugs="$slug_file" -v f_tree="$tree_file" -v f_exp="$exp_file" \
+    -v f_all="$all_file" -v f_all2="$all2_file" -v use_exp="$exp_avail" '
+      FILENAME == f_slugs { if ($1 != "") slug[$1] = $2; next }
+      FILENAME == f_tree  { if ($1 != "") intree[$1] = 1; next }
+      FILENAME == f_exp   { if ($1 != "") inexp[$1] = 1; next }
+      FILENAME == f_all2  { if ($2 != "") { asp[$2] = $1 }; next }
+      FILENAME == f_all {
+        if ($2 == "") next;
+        pid = $2; sp = $1; ttl = $3; par = $4;
+        r = "";
+        if (!(pid in intree)) r = iadd(r, "not-in-tree");
+        if (par != "") {
+          if (!(par in asp)) r = iadd(r, "dangling-parent");
+          else if (asp[par] != sp) r = iadd(r, "cross-space-parent");
+        }
+        if (use_exp == 1 && !(pid in inexp)) r = iadd(r, "no-export");
+        if (r != "") {
+          s = (sp in slug) ? slug[sp] : sp;
+          print s, pid, ttl, r;
+        }
+      }
+      function iadd(list, item) { return (list == "" ? item : list "," item) }
+    ' "$slug_file" "$tree_file" "$exp_file" "$all2_file" "$all_file")"
+
+  local n_find=0
+  if [ -n "$findings" ]; then
+    printf '%s\n' "$findings"
+    n_find="$(printf '%s\n' "$findings" | awk 'NF>0' | wc -l | tr -d ' ')"
+  fi
+
+  # 5) Optionale Reparatur: not-in-tree-Seiten an einen Parent umhaengen.
+  local n_fix_fail=0
+  if [ "$fix_set" -eq 1 ]; then
+    if [ -z "$findings" ]; then
+      note "wiki integrity: --fix-parent: keine Befunde - nichts umzuhaengen"
+    else
+      local fslug fpid ftitle freasons
+      while IFS=$'\t' read -r fslug fpid ftitle freasons; do
+        [ -n "$fpid" ] || continue
+        case "$freasons" in
+          *not-in-tree*) ;;
+          *) note "wiki integrity: --fix-parent: $fpid ($freasons) uebersprungen (nicht not-in-tree)"; continue ;;
+        esac
+        if [ "$dry" -eq 1 ]; then
+          printf 'DRY\t%s\t%s\t%s\n' "$fpid" "$fslug" "${fix_parent:-<root>}"
+          continue
+        fi
+        if ( wiki_reparent "$fpid" "$fix_parent" ) >/dev/null 2>&1; then
+          printf 'OK\t%s\t%s\t%s\n' "$fpid" "$fslug" "${fix_parent:-<root>}"
+        else
+          printf 'FAIL\t%s\t%s\t%s\n' "$fpid" "$fslug" "${fix_parent:-<root>}"
+          note "wiki integrity: Umhaengen fehlgeschlagen (id=$fpid)"
+          n_fix_fail=$((n_fix_fail + 1))
+        fi
+      done <<< "$findings"
+    fi
+  fi
+
+  note "wiki integrity: spaces=$n_spaces seiten=$n_total im-baum=$n_tree befunde=$n_find reparatur-fehler=$n_fix_fail"
+  if [ "$n_fix_fail" -gt 0 ]; then return 1; fi
+  if [ "$n_find" -gt 0 ] && [ "$fix_set" -eq 0 ]; then return 1; fi
+  return 0
+}
+
 
 wiki_cmd() {
   local args=() sub
@@ -1038,10 +1272,11 @@ wiki_cmd() {
     update) wiki_update "$@" ;;
     upload) wiki_upload "$@" ;;
     export) wiki_export "$@" ;;
+    integrity|orphans) wiki_integrity "$@" ;;
     me) wiki_me "$@" ;;
     profile) wiki_profile "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "wiki: unbekannter Unterbefehl (spaces|pages|get|search|create|update|upload|export)" ;;
+    *) die "wiki: unbekannter Unterbefehl (spaces|pages|get|search|create|update|upload|export|integrity)" ;;
   esac
 }
 

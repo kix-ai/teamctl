@@ -1774,6 +1774,246 @@ else
   fail "19g: unlink ohne --slug meldet Erfolg"
 fi
 
+# --- 17) wiki integrity: Orphans / Integritaetsluecke -----------------------
+# 'wiki integrity' vergleicht den Sidebar-Baum (erreichbare Seiten) mit der
+# vollstaendigen Seitentabelle (pages/recent) und meldet Orphans
+# (not-in-tree), tote Parents (dangling-parent), space-fremde Parents
+# (cross-space-parent) und fehlende Export-Dateien (no-export). --fix-parent
+# haengt not-in-tree-Seiten mit Read-back um (pages/move). Der curl-Stub
+# emuliert die Docmost-API offline; moves landen in $INT_LOG.
+INTBIN="$WORK/intbin"; mkdir -p "$INTBIN"
+cat > "$INTBIN/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub: emuliert die Docmost-Seiten-API (kein Netz). Schaltet per INT_MODE
+# zwischen "orphans" (Default) und "clean"; INT_RB erzwingt einen
+# Read-back-Mismatch (pages/info liest dann aus INT_ORIG).
+out=/dev/null; data=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -X) shift 2 ;;
+    --data-binary) data="$2"; shift 2 ;;
+    -D|-H|--max-time|-w|-b|-c|--cacert) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+ep="${url##*/api/}"
+body='{"message":"stub: unhandled"}'; code=200
+mode="${INT_MODE:-orphans}"
+case "$ep" in
+  auth/login) body='{"data":{"user":{"name":"selftest"}}}' ;;
+  spaces/) body='{"data":{"items":[{"id":"sp-1","slug":"general","name":"General"},{"id":"sp-2","slug":"team-dev","name":"Team Dev"}]}}' ;;
+  pages/sidebar-pages)
+    pg="$(printf '%s' "$data" | jq -r '.pageId // empty')"
+    sp="$(printf '%s' "$data" | jq -r '.spaceId // empty')"
+    if [ -n "$pg" ]; then
+      case "$pg" in
+        p1) body='{"data":{"items":[{"id":"p2","title":"Kind","hasChildren":false,"position":"a0VV0"}]}}' ;;
+        *)  body='{"data":{"items":[]}}' ;;
+      esac
+    else
+      case "$sp" in
+        sp-1) body='{"data":{"items":[{"id":"p1","title":"Page One","hasChildren":true,"position":"a0VV0"}]}}' ;;
+        sp-2) body='{"data":{"items":[{"id":"p4","title":"Team Dev","hasChildren":false,"position":"a0VV0"}]}}' ;;
+        *)    body='{"data":{"items":[]}}' ;;
+      esac
+    fi ;;
+  pages/recent)
+    cur="$(printf '%s' "$data" | jq -r '.cursor // empty')"
+    sp="$(printf '%s' "$data" | jq -r '.spaceId // empty')"
+    rb() { if [ -n "$sp" ] && [ "$sp" != "$1" ]; then printf ''; else printf '%s' "$2"; fi; }
+    if [ "$mode" = "clean" ]; then
+      i1="$(rb sp-1 '{"id":"p1","title":"Page One","spaceId":"sp-1","parentPageId":null}')"
+      i2="$(rb sp-1 '{"id":"p2","title":"Kind","spaceId":"sp-1","parentPageId":"p1"}')"
+      items="$(printf '%s\n%s\n' "$i1" "$i2" | awk 'NF>0' | paste -sd, -)"
+      body="$(jq -nc --argjson it "[$items]" '{data:{items:$it,meta:{hasNextPage:false,nextCursor:null}}}')"
+    elif [ -n "$cur" ]; then
+      i3="$(rb sp-1 '{"id":"p3","title":"Verwaist","spaceId":"sp-1","parentPageId":"p9"}')"
+      i4="$(rb sp-2 '{"id":"p4","title":"Team Dev","spaceId":"sp-2","parentPageId":null}')"
+      i5="$(rb sp-2 '{"id":"p5","title":"Fremd-Parent","spaceId":"sp-2","parentPageId":"p1"}')"
+      items="$(printf '%s\n%s\n%s\n' "$i3" "$i4" "$i5" | awk 'NF>0' | paste -sd, -)"
+      body="$(jq -nc --argjson it "[$items]" '{data:{items:$it,meta:{hasNextPage:false,nextCursor:null}}}')"
+    else
+      i1="$(rb sp-1 '{"id":"p1","title":"Page One","spaceId":"sp-1","parentPageId":null}')"
+      i2="$(rb sp-1 '{"id":"p2","title":"Kind","spaceId":"sp-1","parentPageId":"p1"}')"
+      items="$(printf '%s\n%s\n' "$i1" "$i2" | awk 'NF>0' | paste -sd, -)"
+      body="$(jq -nc --argjson it "[$items]" '{data:{items:$it,meta:{hasNextPage:true,nextCursor:"c1"}}}')"
+    fi ;;
+  pages/info)
+    readstate="$INT_STATE"; if [ -n "${INT_RB:-}" ]; then readstate="$INT_ORIG"; fi
+    pg="$(printf '%s' "$data" | jq -r '.pageId // empty')"
+    line="$(awk -F'\t' -v p="$pg" '$1==p{print; exit}' "$readstate")"
+    sp="$(printf '%s' "$line" | cut -f2)"; par="$(printf '%s' "$line" | cut -f3)"; ttl="$(printf '%s' "$line" | cut -f4)"
+    if [ -z "$par" ]; then pj=null; else pj="\"$par\""; fi
+    body="$(jq -nc --arg s "$sp" --arg t "$ttl" --argjson p "$pj" '{data:{spaceId:$s,title:$t,parentPageId:$p}}')" ;;
+  pages/move)
+    pg="$(printf '%s' "$data" | jq -r '.pageId')"; par="$(printf '%s' "$data" | jq -r '.parentPageId // empty')"
+    awk -F'\t' -v OFS='\t' -v p="$pg" -v n="$par" '{ if ($1==p) $3=n; print }' "$INT_STATE" > "$INT_STATE.new" && mv "$INT_STATE.new" "$INT_STATE"
+    printf '%s\t%s\t%s\n' "$pg" "$par" "$(printf '%s' "$data" | jq -r '.position')" >> "$INT_LOG"
+    body='{"data":{}}' ;;
+  *) code=500 ;;
+esac
+printf '%s' "$body" > "$out"
+printf '%s' "$code"
+STUB
+chmod +x "$INTBIN/curl"
+cat > "$INTBIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+printf 'dummy\n'
+exit 0
+STUB
+chmod +x "$INTBIN/ssh"
+
+INTKEY="$WORK/id_int_dummy"; : > "$INTKEY"
+INTLOG="$WORK/int.log"
+INTSTATE="$WORK/int_state.tsv"
+INTORIG="$WORK/int_state.orig.tsv"
+INTEXP="$WORK/intexp"; INTEXPC="$WORK/intexp-clean"
+mkdir -p "$INTEXP" "$INTEXPC"
+printf 'general__page-one.md\tp1\tgeneral\tPage One\nteam-dev__team-dev.md\tp4\tteam-dev\tTeam Dev\n' > "$INTEXP/.wiki-sync-manifest.tsv"
+printf 'general__page-one.md\tp1\tgeneral\tPage One\ngeneral__kind.md\tp2\tgeneral\tKind\n' > "$INTEXPC/.wiki-sync-manifest.tsv"
+
+# Fixture: sp-1/general Baum =(p1 -> p2); p3 haengt an fehlendem p9;
+# sp-2/team-dev Baum =(p4); p5 haengt an p1 (anderer Space). Der Export kennt
+# nur p1 und p4 -> p2 ist der reine no-export-Fall.
+int_state_reset() {
+  printf 'p1\tsp-1\t\tPage One\np2\tsp-1\tp1\tKind\np3\tsp-1\tp9\tVerwaist\np4\tsp-2\t\tTeam Dev\np5\tsp-2\tp1\tFremd-Parent\n' > "$INTSTATE"
+  cp "$INTSTATE" "$INTORIG"
+  : > "$INTLOG"
+}
+int_run_sub() {  # <integrity|orphans> [argumente...]
+  local sub="$1"; shift
+  env PATH="$INTBIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+    TEAMCTL_SSH_KEY="$INTKEY" TEAMCTL_WIKI_INTEGRITY_SLEEP=0 \
+    TEAMCTL_WIKI_INTEGRITY_PAGE_LIMIT=2 \
+    INT_MODE="${INT_MODE:-orphans}" INT_RB="${INT_RB:-}" \
+    INT_STATE="$INTSTATE" INT_ORIG="$INTORIG" INT_LOG="$INTLOG" \
+    bash "$TEAMCTL" wiki "$sub" "$@"
+}
+int_run()       { int_run_sub integrity "$@"; }
+int_run_alias() { int_run_sub orphans "$@"; }
+int_has() { printf '%s\n' "$1" | grep -qF -- "$2"; }
+
+# 17a) Befunde + Gruende + Exit 1; saubere Seiten tauchen nicht auf.
+int_state_reset
+out17a="$(int_run --export-dir "$INTEXP" 2>/dev/null)"; rc17a=$?
+l17a="$(printf '%s\n' "$out17a" | awk 'NF>0' | wc -l | tr -d ' ')"
+if [ "$rc17a" -ne 1 ]; then
+  fail "wiki integrity (17a): Exit != 1 bei Befunden (war $rc17a)"
+elif [ "$l17a" -ne 3 ]; then
+  fail "wiki integrity (17a): erwartet 3 Befunde, waren $l17a"
+  printf '%s\n' "$out17a" | sed 's/^/      /' >&2
+elif ! int_has "$out17a" "$(printf 'general\tp3\tVerwaist\tnot-in-tree,dangling-parent,no-export')"; then
+  fail "wiki integrity (17a): p3 (dangling-parent) fehlt/falsch"
+elif ! int_has "$out17a" "$(printf 'team-dev\tp5\tFremd-Parent\tnot-in-tree,cross-space-parent,no-export')"; then
+  fail "wiki integrity (17a): p5 (cross-space-parent) fehlt/falsch"
+elif ! int_has "$out17a" "$(printf 'general\tp2\tKind\tno-export')"; then
+  fail "wiki integrity (17a): p2 (nur no-export) fehlt"
+elif int_has "$out17a" "$(printf 'general\tp1')"; then
+  fail "wiki integrity (17a): saubere Seite p1 faelschlich gemeldet"
+else
+  pass "wiki integrity (17a): Orphans + Gruende (not-in-tree/dangling-parent/cross-space-parent/no-export), Exit 1"
+fi
+
+# 17b) --no-export unterdrueckt die Export-Pruefung.
+int_state_reset
+out17b="$(int_run --export-dir "$INTEXP" --no-export 2>/dev/null)"; rc17b=$?
+l17b="$(printf '%s\n' "$out17b" | awk 'NF>0' | wc -l | tr -d ' ')"
+if [ "$rc17b" -ne 1 ] || [ "$l17b" -ne 2 ]; then
+  fail "wiki integrity (17b): --no-export erwartet 2 Befunde/Exit 1 (rc=$rc17b, n=$l17b)"
+elif int_has "$out17b" "no-export"; then
+  fail "wiki integrity (17b): --no-export meldet trotzdem no-export"
+else
+  pass "wiki integrity (17b): --no-export unterdrueckt die Export-Pruefung (2 Befunde)"
+fi
+
+# 17c) Sauberer Baum: keine Befunde, Exit 0, leere Ausgabe.
+int_state_reset
+out17c="$(INT_MODE=clean int_run --export-dir "$INTEXPC" 2>/dev/null)"; rc17c=$?
+if [ "$rc17c" -ne 0 ]; then
+  fail "wiki integrity (17c): sauberer Baum -> Exit != 0 (war $rc17c)"
+elif [ -n "$out17c" ]; then
+  fail "wiki integrity (17c): sauberer Baum -> unerwartete Ausgabe"
+else
+  pass "wiki integrity (17c): sauberer Baum -> keine Befunde, Exit 0"
+fi
+
+# 17d) --fix-parent --dry-run: DRY-Zeile, aber kein move.
+int_state_reset
+out17d="$(int_run --space sp-1 --export-dir "$INTEXP" --fix-parent p1 --dry-run 2>/dev/null)"; rc17d=$?
+if [ "$rc17d" -ne 0 ]; then
+  fail "wiki integrity (17d): --fix-parent --dry-run Exit != 0 (war $rc17d)"
+elif ! int_has "$out17d" "$(printf 'DRY\tp3\tgeneral\tp1')"; then
+  fail "wiki integrity (17d): DRY-Zeile fuer p3 fehlt"
+elif [ -s "$INTLOG" ]; then
+  fail "wiki integrity (17d): --dry-run hat pages/move aufgerufen"
+else
+  pass "wiki integrity (17d): --fix-parent --dry-run zeigt nur an, kein move"
+fi
+
+# 17e) --fix-parent (echt): move + Read-back, Parent danach p1, Exit 0.
+int_state_reset
+out17e="$(int_run --space sp-1 --export-dir "$INTEXP" --fix-parent p1 2>/dev/null)"; rc17e=$?
+if [ "$rc17e" -ne 0 ]; then
+  fail "wiki integrity (17e): --fix-parent Exit != 0 (war $rc17e)"
+elif ! int_has "$out17e" "$(printf 'OK\tp3\tgeneral\tp1')"; then
+  fail "wiki integrity (17e): OK-Zeile fuer p3 fehlt"
+elif ! grep -q "$(printf 'p3\tp1\t')" "$INTLOG"; then
+  fail "wiki integrity (17e): pages/move nicht mit Ziel-Parent p1 aufgerufen"
+elif [ "$(awk -F'\t' '$1=="p3"{print $3}' "$INTSTATE")" != "p1" ]; then
+  fail "wiki integrity (17e): Parent von p3 nach der Reparatur nicht p1"
+else
+  pass "wiki integrity (17e): --fix-parent haengt p3 mit Read-back an p1 um (Exit 0)"
+fi
+
+# 17f) Read-back-Mismatch -> FAIL + Exit 1 (keine stille Falschmeldung).
+int_state_reset
+out17f="$(INT_RB=1 int_run --space sp-1 --export-dir "$INTEXP" --fix-parent p1 2>/dev/null)"; rc17f=$?
+if [ "$rc17f" -ne 1 ]; then
+  fail "wiki integrity (17f): Read-back-Mismatch -> Exit != 1 (war $rc17f)"
+elif ! int_has "$out17f" "$(printf 'FAIL\tp3\tgeneral\tp1')"; then
+  fail "wiki integrity (17f): FAIL-Zeile fuer p3 fehlt"
+else
+  pass "wiki integrity (17f): Read-back-Mismatch -> FAIL + Exit 1"
+fi
+
+# 17g) Unbekannter Space -> klare Meldung, Exit != 0.
+int_state_reset
+err17g="$(int_run --space sp-9 --export-dir "$INTEXP" --no-export 2>&1 >/dev/null)"; rc17g=$?
+if [ "$rc17g" -ne 0 ] && printf '%s' "$err17g" | grep -q 'nicht gefunden'; then
+  pass "wiki integrity (17g): unbekannter Space -> klarer Fehler"
+else
+  fail "wiki integrity (17g): unbekannter Space ohne klaren Fehler (rc=$rc17g)"
+fi
+
+# 17h) Explizites --export-dir ohne Export -> klare Meldung, Exit != 0.
+int_state_reset
+err17h="$(int_run --export-dir "$WORK/no-such-export" 2>&1 >/dev/null)"; rc17h=$?
+if [ "$rc17h" -ne 0 ] && printf '%s' "$err17h" | grep -q 'kein Export'; then
+  pass "wiki integrity (17h): --export-dir ohne Export -> klarer Fehler"
+else
+  fail "wiki integrity (17h): fehlender Export ohne klare Meldung (rc=$rc17h)"
+fi
+
+# 17i) Alias 'wiki orphans' liefert dasselbe Ergebnis wie 'wiki integrity'.
+int_state_reset
+out17i="$(int_run_alias --export-dir "$INTEXP" --no-export 2>/dev/null)"; rc17i=$?
+if [ "$rc17i" -eq 1 ] && [ "$out17i" = "$out17b" ]; then
+  pass "wiki integrity (17i): Alias 'wiki orphans' identisch zu 'wiki integrity'"
+else
+  fail "wiki integrity (17i): Alias 'wiki orphans' abweichend (rc=$rc17i)"
+fi
+
+# 17j) Dispatch + usage dokumentieren den Unterbefehl.
+help17j="$(bash "$TEAMCTL" --help 2>&1 || true)"
+if grep -q 'integrity|orphans) wiki_integrity' "$TEAMCTL" \
+   && printf '%s' "$help17j" | grep -q 'wiki integrity'; then
+  pass "wiki integrity (17j): Dispatch + usage dokumentiert"
+else
+  fail "wiki integrity (17j): Dispatch/usage fehlt"
+fi
+
 # --- Ergebnis ---------------------------------------------------------------
 if [ "$FAILS" -gt 0 ]; then
   printf 'FAIL: %d Test(s) fehlgeschlagen\n' "$FAILS" >&2

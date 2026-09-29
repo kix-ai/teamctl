@@ -95,6 +95,7 @@ WIKI (Docmost)
     teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>|--parent '']
     teamctl wiki upload <pageId> <bilddatei>
     teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
+    teamctl wiki integrity [--space <spaceId>] [--export-dir DIR] [--no-export] [--fix-parent <pageId|''>] [--dry-run] (Alias: orphans)
     (optional ueberall: --as <email|name>)
     (wiki update --parent <pageId> haengt die Seite um; --parent '' loest sie auf Root)
     (wiki create/update verifizieren Titel, --parent-parentPageId und den
@@ -267,6 +268,57 @@ ausschliesslich der Titel durchsucht.
 | Variable | Default | Bedeutung |
 | --- | --- | --- |
 | `TEAMCTL_WIKI_SEARCH_MAX_AGE` | `24` | Stunden, ab denen der Export als veraltet gilt |
+
+## Wiki-Integritaet / verwaiste Seiten: `teamctl wiki integrity`
+
+`teamctl wiki integrity` (Alias: `teamctl wiki orphans`) findet Seiten, die in
+**keinem** Sidebar-Baum haengen. Docmost zeigt im Baum nur Seiten, die ueber
+`parentPageId` erreichbar sind (Wurzel: `parentPageId is null` im jeweiligen
+Space); Seiten, deren Parent geloescht wurde oder in einem **anderen** Space
+liegt, sind dadurch ueber Navigation, `wiki search`/Export und `wiki export`
+unauffindbar - genau die gemeldete Integritaetsluecke (z. B.
+Red-Team-Uebergabeseiten).
+
+Der Befehl vergleicht zwei Quellen:
+
+- den **Sidebar-Baum** je Space (`pages/sidebar-pages`, rekursiv) und
+- die **vollstaendige Seitentabelle** ueber die cursor-paginierte API
+  `pages/recent` (alle nicht geloeschten Seiten der sichtbaren Spaces,
+  unabhaengig von der Baum-Erreichbarkeit).
+
+Ausgabe je Befund TAB-getrennt `spaceSlug<TAB>pageId<TAB>title<TAB>gruende`:
+
+| Grund | Bedeutung |
+| --- | --- |
+| `not-in-tree` | Seite haengt in KEINEM Sidebar-Baum (Kern-Orphan: Navigation/Suche/Export unerreichbar) |
+| `dangling-parent` | `parentPageId` zeigt auf eine nicht (mehr) existierende Seite (z. B. nach Soft-Delete) |
+| `cross-space-parent` | `parentPageId` zeigt auf eine Seite in einem anderen Space |
+| `no-export` | Seite fehlt im lokalen Export (nur wenn ein Export gefunden wurde) |
+
+    teamctl wiki integrity [--space <spaceId>] [--export-dir DIR] [--no-export] \
+                           [--fix-parent <pageId|''>] [--dry-run]
+
+| Option | Bedeutung |
+| --- | --- |
+| `--space <spaceId>` | Baum UND Seitentabelle auf einen Space beschraenken |
+| `--export-dir DIR` | Exportverzeichnis (Default: `WIKI_EXPORT_DIR`, sonst `~/.openclaw/wiki`); fehlt es dort, bricht der Befehl mit klarer Meldung ab |
+| `--no-export` | Export-Pruefung abschalten |
+| `--fix-parent <pageId>` | die `not-in-tree`-Seiten an `<pageId>` umhaengen (`pages/move` + Read-back); `''` loest sie auf Root |
+| `--dry-run` | mit `--fix-parent` nur anzeigen, was passieren wuerde (`DRY`-Zeilen) |
+
+- **Exit:** `0` = keine offenen Befunde, `1` = Befunde bzw. fehlgeschlagene
+  Reparatur. So eignet sich der Befehl als Integritaets-Guard in Skripten.
+- `--fix-parent` haengt **nur** `not-in-tree`-Seiten um (andere Gruende werden
+  uebersprungen) und verifiziert jede Umhaengung per Read-back; Erfolg/Fehler
+  erscheint je Seite als `OK`/`FAIL`-Zeile. Ein `--space` begrenzt die
+  Reparatur zusaetzlich.
+- Ohne `--fix-parent` liest der Befehl nur (nicht-destruktiv).
+
+| Variable | Default | Bedeutung |
+| --- | --- | --- |
+| `TEAMCTL_WIKI_INTEGRITY_PAGE_LIMIT` | `100` | Seitengroesse je `pages/recent`-Aufruf (1-100, Docmost-Grenze) |
+| `TEAMCTL_WIKI_INTEGRITY_MAXPAGES` | `2000` | Sicherheitsgrenze gegen Endlosschleifen beim Blaettern |
+| `TEAMCTL_WIKI_INTEGRITY_SLEEP` | `0.2` | Pause zwischen API-Aufrufen (429-Schutz), Sekunden |
 
 ## Wiki-Seite umhaengen: `teamctl wiki update --parent`
 

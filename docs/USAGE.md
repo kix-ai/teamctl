@@ -15,6 +15,7 @@ WIKI (Docmost)
     teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>|--parent '']
     teamctl wiki upload <pageId> <bilddatei>
     teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
+    teamctl wiki integrity [--space <spaceId>] [--export-dir DIR] [--no-export] [--fix-parent <pageId|''>] [--dry-run]
     teamctl wiki me
     teamctl wiki profile --name <name>
 
@@ -94,6 +95,27 @@ Titel, Body und Tags-Zeile - also auch Begriffe, die nur im Inhalt stehen.
   warnt teamctl auf stderr; die Suche laeuft weiter auf dem Export.
 - `--title` sucht nur Titel ueber die API, `--full` erzwingt die Volltextsuche,
   `--export-dir DIR` waehlt ein anderes Exportverzeichnis.
+
+## Wiki-Integritaet: `teamctl wiki integrity`
+
+`teamctl wiki integrity` (Alias: `teamctl wiki orphans`) findet Seiten, die in
+**keinem** Sidebar-Baum haengen - sie sind ueber Navigation, Volltextsuche und
+Export unauffindbar (z. B. wenn der Parent geloescht wurde oder in einem
+anderen Space liegt).
+
+    teamctl wiki integrity [--space <spaceId>] [--export-dir DIR] [--no-export] \
+                           [--fix-parent <pageId|''>] [--dry-run]
+
+- Der Befehl vergleicht den Sidebar-Baum je Space (`pages/sidebar-pages`) mit
+  der vollstaendigen Seitentabelle (`pages/recent`, cursor-paginiert).
+- Ausgabe je Befund (TAB-getrennt): `spaceSlug`, `pageId`, `title` und
+  `gruende` (`not-in-tree`, `dangling-parent`, `cross-space-parent`,
+  `no-export`).
+- `--fix-parent <pageId>` haengt die `not-in-tree`-Seiten mit Read-back um;
+  `--dry-run` zeigt nur an, was passieren wuerde. `--space` beschraenkt
+  Pruefung und Reparatur auf einen Space, `--no-export` schaltet die
+  Export-Pruefung ab.
+- Exit 0 = keine offenen Befunde, 1 = Befunde bzw. fehlgeschlagene Reparatur.
 
 ## Wiki umhaengen: `teamctl wiki update --parent`
 
