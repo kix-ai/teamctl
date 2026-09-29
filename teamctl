@@ -294,6 +294,7 @@ GIT (GitHub, Konto per Token)
   teamctl git status <dir>
   teamctl git issue <repo|owner/repo> --title <T> (--body <B> | --file <md>) [--label <l>]
   teamctl git issue-close <repo|owner/repo> <nummer>
+  teamctl git issue-comment <repo|owner/repo> <nummer> (--body <B> | --file <md>)
   teamctl git issues <repo> [--state open|closed|all] [--label <l>]
   teamctl git issues-all [--state open|closed|all] [--label <l>]
   teamctl git pulls <repo> [--state open|closed|all] [--label <l>]
@@ -1591,6 +1592,42 @@ git_issue_close() {
   printf 'OK\t%s\t%s\t%s\t%s\n' "$GIT_OWNER/$GIT_REPO" "$num" "$state" "$url"
 }
 
+# git_issue_comment <repo|owner/repo> <nummer> (--body <B> | --file <md>)
+# Postet einen Kommentar auf ein Issue (POST
+# /repos/{owner}/{repo}/issues/{nr}/comments) und verifiziert ihn per Read-back:
+# der angelegte Kommentar wird ueber seine ID erneut gelesen
+# (GET /repos/{owner}/{repo}/issues/comments/{id}) und der Inhalt verglichen.
+# Ausgabe (TAB-getrennt): OK<TAB>owner/repo<TAB>nummer<TAB>kommentar-id<TAB>url
+git_issue_comment() {
+  [ $# -ge 2 ] || die "git issue-comment: <repo> <nummer> fehlt"
+  local repo="$1" num="$2"; shift 2
+  local body="" file="" payload id url cbody
+  while [ $# -gt 0 ]; do case "$1" in
+    --body) [ $# -ge 2 ] || die "git issue-comment: --body braucht einen Wert"; body="$2"; shift 2 ;;
+    --file) [ $# -ge 2 ] || die "git issue-comment: --file braucht einen Wert"; file="$2"; shift 2 ;;
+    *) die "git issue-comment: unbekannte Option '$1'" ;;
+  esac; done
+  git_owner_repo "git issue-comment" "$repo"
+  [[ "$num" =~ ^[0-9]+$ ]] || die "git issue-comment: ungueltige Nummer '$num'"
+  if [ -n "$file" ] && [ -n "$body" ]; then die "git issue-comment: --body und --file nicht gleichzeitig"; fi
+  if [ -n "$file" ]; then
+    [ -f "$file" ] || die "Datei nicht gefunden: $file"
+    body="$(cat "$file")"
+  fi
+  [ -n "$body" ] || die "git issue-comment: --body oder --file fehlt (Kommentartext)"
+  payload="$(jq -nc --arg b "$body" '{body:$b}')"
+  gh_api POST "/repos/$GIT_OWNER/$GIT_REPO/issues/$num/comments" "$payload" || die "HTTP $GH_HTTP: $(git_err)"
+  note "POST issue-comment: HTTP $GH_HTTP"
+  id="$(printf '%s' "$GH_BODY" | jq -r '.id // empty')"
+  url="$(printf '%s' "$GH_BODY" | jq -r '.html_url // empty')"
+  [ -n "$id" ] || die "git issue-comment: keine Kommentar-ID in der Antwort"
+  gh_api GET "/repos/$GIT_OWNER/$GIT_REPO/issues/comments/$id" "" || die "Read-back HTTP $GH_HTTP: $(git_err)"
+  note "GET issue-comment: HTTP $GH_HTTP"
+  cbody="$(printf '%s' "$GH_BODY" | jq -r '.body // empty')"
+  [ "$cbody" = "$body" ] || die "git issue-comment: Verifikation fehlgeschlagen (Inhalt weicht ab)"
+  printf 'OK\t%s\t%s\t%s\t%s\n' "$GIT_OWNER/$GIT_REPO" "$num" "$id" "$url"
+}
+
 # Gemeinsame Verarbeitung der Filter-Optionen --state/--label fuer
 # listen-artige Git-Befehle (issues/pulls). Setzt die Variablen
 # GIT_LIST_STATE (open|closed|all), GIT_LIST_LABEL und GIT_LIST_LABEL_ENC
@@ -1711,12 +1748,13 @@ git_cmd() {
     status) git_status "$@" ;;
     issue) git_issue "$@" ;;
     issue-close) git_issue_close "$@" ;;
+    issue-comment) git_issue_comment "$@" ;;
     issues) git_issues "$@" ;;
     issues-all) git_issues_all "$@" ;;
     pulls) git_pulls "$@" ;;
     pulls-all) git_pulls_all "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "git: unbekannter Unterbefehl (info|branches|commits|repos|list|create-repo|upload|read|cat|clone|pull|status|issue|issue-close|issues|issues-all|pulls|pulls-all)" ;;
+    *) die "git: unbekannter Unterbefehl (info|branches|commits|repos|list|create-repo|upload|read|cat|clone|pull|status|issue|issue-close|issue-comment|issues|issues-all|pulls|pulls-all)" ;;
   esac
 }
 

@@ -116,6 +116,7 @@ GIT (GitHub, Konto per Token)
     teamctl git issue <repo> --title <T> (--body <B> | --file <md>) [--label <l>]
                       [--author <agent-id>] [--require-author]
     teamctl git issue-close <repo> <nummer>
+    teamctl git issue-comment <repo> <nummer> (--body <B> | --file <md>)
     teamctl git issues <repo> [--state open|closed|all] [--label <l>]
     teamctl git issues-all [--state open|closed|all] [--label <l>]
 
@@ -159,6 +160,20 @@ ein Issue traegt im Titel das Praefix `[<agent-id>]` und beginnt im Body mit
 
 Ohne die neuen Flags bleiben Titel und Body unveraendert; die Pruefung aendert die
 stdout-Ausgabe nicht (Hinweise gehen ausschliesslich auf stderr).
+
+### Kommentare auf Issues: `git issue-comment`
+
+`teamctl git issue-comment <repo|owner/repo> <nummer> (--body <B> | --file <md>)`
+postet einen Kommentar auf ein Issue (`POST /repos/{owner}/{repo}/issues/{nr}/comments`)
+und verifiziert ihn per Read-back: der angelegte Kommentar wird ueber seine ID
+erneut gelesen (`GET /repos/{owner}/{repo}/issues/comments/{id}`) und der Inhalt
+mit der Eingabe verglichen. Bei Abweichung bricht der Befehl mit Exit ungleich 0 ab.
+
+- `--body` fuer Inline-Text, `--file <md>` fuer eine Markdown-Datei (nicht beide
+  gleichzeitig); leere Eingaben werden abgelehnt.
+- `<repo>` akzeptiert wie `git issue`/`git issue-close` die Form `<repo>` (Owner =
+  `TEAMCTL_GIT_OWNER`) und `<owner>/<repo>` fuer fremde Repos.
+- Ausgabe (TAB-getrennt): `OK<TAB>owner/repo<TAB>nummer<TAB>kommentar-id<TAB>url`.
 
 ## Wiki-Export fuer die Memory-Suche: `teamctl wiki export`
 

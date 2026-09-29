@@ -1230,6 +1230,145 @@ else
   pass "M1 (Issue #25): --prune entfernt alle nicht im Manifest stehenden *.md"
 fi
 
+# --- 16) git issue-comment: Kommentar + Read-back-Verifikation (Issue #26) ---
+# Der Befehl postet einen Kommentar (POST .../issues/{nr}/comments) und liest
+# ihn ueber seine ID erneut (GET .../issues/comments/{id}) zurueck; bei
+# abweichendem Inhalt bricht er ab. Der curl-Stub emuliert die Kommentar-API
+# offline; jede Anfrage wird in $IC_LOG protokolliert, der zuletzt gepostete
+# Body in $IC_POSTED abgelegt.
+ICBIN="$WORK/icbin"; mkdir -p "$ICBIN"
+cat > "$ICBIN/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub: emuliert die GitHub-Kommentar-API (kein Netz). Protokollzeile:
+# <METHODE>\t<URL>\t<BODY>
+method=GET; out=/dev/null; data=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    --data-binary) data="$2"; shift 2 ;;
+    -H|--max-time|-w) shift 2 ;;
+    -sS|-s|-S) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\t%s\t%s\n' "$method" "$url" "$data" >> "$IC_LOG"
+body=""; code=200
+case "$method $url" in
+  "POST "*"/issues/"*"/comments")
+    printf '%s' "$data" | jq -r '.body' > "$IC_POSTED"
+    if [ -n "$IC_POST_FAIL" ]; then
+      code=500; body='{"message":"stub: comment abgelehnt"}'
+    else
+      body='{"id":9001,"html_url":"https://example.invalid/c/9001"}'; code=201
+    fi ;;
+  "GET "*"/issues/comments/9001")
+    if [ -n "$IC_READBACK_OVERRIDE" ]; then rb="$IC_READBACK_OVERRIDE"
+    else rb="$(cat "$IC_POSTED" 2>/dev/null)"; fi
+    body="$(jq -nc --arg b "$rb" '{id:9001,body:$b}')" ;;
+  *)
+    code=500; body='{"message":"stub: unhandled request"}' ;;
+esac
+printf '%s' "$body" > "$out"
+printf '%s' "$code"
+STUB
+chmod +x "$ICBIN/curl"
+
+IC_LOG="$WORK/ic.log"; IC_POSTED="$WORK/ic.posted"
+IC_POST_FAIL=""; IC_READBACK_OVERRIDE=""
+ic_run() {  # $@ = Argumente fuer git issue-comment (repo/nummer fest: teamctl 26)
+  : > "$IC_LOG"; : > "$IC_POSTED"
+  PATH="$ICBIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+    TEAMCTL_GITHUB_TOKEN_CMD='printf selftest-token' \
+    IC_LOG="$IC_LOG" IC_POSTED="$IC_POSTED" IC_POST_FAIL="$IC_POST_FAIL" \
+    IC_READBACK_OVERRIDE="$IC_READBACK_OVERRIDE" \
+    bash "$TEAMCTL" git issue-comment teamctl 26 "$@"
+}
+
+# 16a) Positiv --body: Exit 0, korrekte Ausgabe, POST + Read-back im Log.
+icout="$(ic_run --body 'Hallo Kommentar' 2>&1)"; icrc=$?
+okline="$(printf '%s\n' "$icout" | grep -m1 '^OK')"
+if [ "$icrc" -ne 0 ]; then
+  fail "git issue-comment (16a): Exit != 0 (war $icrc)"
+  printf '%s\n' "$icout" | sed 's/^/      /' >&2
+elif [ "$okline" != "$(printf 'OK\tselftest-owner/teamctl\t26\t9001\thttps://example.invalid/c/9001')" ]; then
+  fail "git issue-comment (16a): Ausgabe unerwartet ('$okline')"
+elif ! grep -q 'POST.*/repos/selftest-owner/teamctl/issues/26/comments' "$IC_LOG"; then
+  fail "git issue-comment (16a): kein POST auf die Kommentar-URL"
+elif ! grep -q 'GET.*/repos/selftest-owner/teamctl/issues/comments/9001' "$IC_LOG"; then
+  fail "git issue-comment (16a): kein Read-back per Kommentar-ID"
+elif [ "$(cat "$IC_POSTED")" != "Hallo Kommentar" ]; then
+  fail "git issue-comment (16a): geposteter Body weicht ab ('$(cat "$IC_POSTED")')"
+else
+  pass "git issue-comment (Issue #26, 16a): Kommentar gepostet + Read-back verifiziert"
+fi
+
+# 16b) Positiv --file: Markdown-Datei wird als Body gepostet.
+ICF="$WORK/ic-comment.md"
+printf 'Erste Zeile\n\nZweite Zeile mit Wort.\n' > "$ICF"
+icout2="$(ic_run --file "$ICF" 2>&1)"; icrc2=$?
+if [ "$icrc2" -ne 0 ] || ! grep -q '^OK' <<<"$icout2"; then
+  fail "git issue-comment (16b): --file Exit != 0 (war $icrc2)"
+  printf '%s\n' "$icout2" | sed 's/^/      /' >&2
+elif [ "$(cat "$IC_POSTED")" != "$(cat "$ICF")" ]; then
+  fail "git issue-comment (16b): --file-Body weicht ab"
+else
+  pass "git issue-comment (Issue #26, 16b): --file gepostet und zurueckgelesen"
+fi
+
+# 16c) Read-back-Mismatch -> Abbruch (Exit != 0) mit Verifikationsmeldung.
+IC_READBACK_OVERRIDE='etwas anderes'
+icout3="$(ic_run --body 'Original' 2>&1)"; icrc3=$?
+IC_READBACK_OVERRIDE=""
+if [ "$icrc3" -eq 0 ]; then
+  fail "git issue-comment (16c): Exit 0 trotz abweichendem Read-back"
+elif ! printf '%s' "$icout3" | grep -q 'Verifikation'; then
+  fail "git issue-comment (16c): keine Verifikationsmeldung"
+  printf '%s\n' "$icout3" | sed 's/^/      /' >&2
+else
+  pass "git issue-comment (Issue #26, 16c): Read-back-Mismatch -> Abbruch (Exit $icrc3)"
+fi
+
+# 16d) --body und --file gleichzeitig -> Abbruch ohne API-Aufruf.
+icout4="$(ic_run --body x --file "$ICF" 2>&1)"; icrc4=$?
+if [ "$icrc4" -eq 0 ] || [ -s "$IC_LOG" ]; then
+  fail "git issue-comment (16d): --body+--file nicht abgelehnt (rc=$icrc4)"
+else
+  pass "git issue-comment (Issue #26, 16d): --body+--file -> Abbruch ohne API-Aufruf"
+fi
+
+# 16e) Kein Text -> Abbruch.
+icout5="$(ic_run 2>&1)"; icrc5=$?
+if [ "$icrc5" -eq 0 ]; then
+  fail "git issue-comment (16e): fehlender Text nicht abgelehnt"
+else
+  pass "git issue-comment (Issue #26, 16e): fehlender Text -> Abbruch (Exit $icrc5)"
+fi
+
+# 16f) Ungueltige Issue-Nummer -> Abbruch ohne API-Aufruf.
+icout6="$(PATH="$ICBIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+  TEAMCTL_GITHUB_TOKEN_CMD='printf selftest-token' IC_LOG="$IC_LOG" IC_POSTED="$IC_POSTED" \
+  IC_POST_FAIL='' IC_READBACK_OVERRIDE='' \
+  bash "$TEAMCTL" git issue-comment teamctl abc --body x 2>&1)"; icrc6=$?
+if [ "$icrc6" -eq 0 ] || [ -s "$IC_LOG" ]; then
+  fail "git issue-comment (16f): ungueltige Nummer nicht abgelehnt (rc=$icrc6)"
+else
+  pass "git issue-comment (Issue #26, 16f): ungueltige Nummer -> Abbruch ohne API-Aufruf"
+fi
+
+# 16g) POST-Fehler (HTTP 500) -> Abbruch mit HTTP-Meldung.
+IC_POST_FAIL=1
+icout7="$(ic_run --body 'x' 2>&1)"; icrc7=$?
+IC_POST_FAIL=""
+if [ "$icrc7" -eq 0 ]; then
+  fail "git issue-comment (16g): Exit 0 trotz POST-Fehler"
+elif ! printf '%s' "$icout7" | grep -q 'HTTP 500'; then
+  fail "git issue-comment (16g): HTTP-500-Meldung fehlt"
+  printf '%s\n' "$icout7" | sed 's/^/      /' >&2
+else
+  pass "git issue-comment (Issue #26, 16g): POST-Fehler -> Abbruch mit HTTP 500"
+fi
+
 # --- Ergebnis ---------------------------------------------------------------
 if [ "$FAILS" -gt 0 ]; then
   printf 'FAIL: %d Test(s) fehlgeschlagen\n' "$FAILS" >&2

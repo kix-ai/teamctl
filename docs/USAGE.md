@@ -39,6 +39,7 @@ GIT (GitHub, Token aus der Konfiguration)
     teamctl git status <dir>
     teamctl git issue <repo|owner/repo> --title <T> (--body <B> | --file <md>) [--label <l>]
     teamctl git issue-close <repo|owner/repo> <nummer>
+    teamctl git issue-comment <repo|owner/repo> <nummer> (--body <B> | --file <md>)
     teamctl git issues <repo> [--state open|closed|all] [--label <l>]
     teamctl git issues-all [--state open|closed|all] [--label <l>]
     teamctl git pulls <repo> [--state open|closed|all] [--label <l>]
