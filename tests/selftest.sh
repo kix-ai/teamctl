@@ -825,6 +825,203 @@ else
   pass "wiki update ohne --parent (Issue #22): kein move, pages/update ohne parentPageId"
 fi
 
+# --- 12) Verifikations-Haertung: wiki create --parent + Inhalts-Read-back ---
+# Hintergrund (team-qa-Review): 'wiki create --parent' verifizierte im Read-back
+# nur den TITEL, nicht parentPageId (gleiche blinde Stelle wie Issue #22); der
+# Inhalts-Read-back in 'wiki update' nutzte nur das erste 6+-alnum-Token als
+# Probe und entfiel ganz bei leerer Probe. Neu: parentPageId-Pruefung beim
+# Anlegen, vollstaendiger/normalisierter Inhaltsvergleich (ALLE Wort-Token) und
+# Fehler bei leerem Inhalt. Der Stub unten emuliert die Seiten-API offline.
+WC="$WORK/wcbin"
+mkdir -p "$WC"
+cat > "$WC/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub: emuliert die Docmost-Seiten-API fuer 'wiki create' (kein Netz).
+# pages/info gibt Titel, Parent und Inhalt aus dem create-Body zurueck
+# (optional per WC_PARENT_OVERRIDE / WC_CONTENT_OMIT manipuliert).
+method=POST; out=/dev/null; data=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    --data-binary) data="$2"; shift 2 ;;
+    -D|-H|--max-time|-w|-b|-c|-F) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+ep="$(printf '%s' "$url" | sed 's#.*/api/##')"
+code=200
+case "$ep" in
+  auth/login)
+    body='{"data":{"user":{"name":"selftest"}}}' ;;
+  pages/create)
+    printf '%s' "$data" > "$WC_CREATE_OUT"
+    if [ -n "$WC_CREATE_FAIL" ]; then code=500; body='{"message":"stub: create abgelehnt"}'
+    else body='{"data":{"id":"pg-new"}}'; fi ;;
+  pages/info)
+    par="$(jq -r '.parentPageId // ""' "$WC_CREATE_OUT" 2>/dev/null)"
+    ttl="$(jq -r '.title // ""' "$WC_CREATE_OUT" 2>/dev/null)"
+    cnt="$(jq -r '.content // ""' "$WC_CREATE_OUT" 2>/dev/null)"
+    if [ -n "$WC_PARENT_OVERRIDE_SET" ]; then par="$WC_PARENT_OVERRIDE"; fi
+    if [ -n "$WC_CONTENT_OMIT" ]; then cnt="$(printf '%s' "$cnt" | sed "s/$WC_CONTENT_OMIT//g")"; fi
+    body="$(jq -nc --arg t "$ttl" --arg p "$par" --arg c "$cnt" '{data:{id:"pg-new",spaceId:"sp-1",title:$t,parentPageId:(if $p == "" then null else $p end),content:$c}}')" ;;
+  *)
+    code=500; body='{"message":"stub: unhandled request"}' ;;
+esac
+printf '%s' "$body" > "$out"
+printf '%s' "$code"
+STUB
+chmod +x "$WC/curl"
+cat > "$WC/ssh" <<'STUB'
+#!/usr/bin/env bash
+printf 'dummy\n'
+exit 0
+STUB
+chmod +x "$WC/ssh"
+
+WC_KEY="$WORK/id_wc_dummy"; : > "$WC_KEY"
+WC_CREATE_OUT="$WORK/wc.create"
+WC_FILE="$WORK/wc-content.md"
+printf 'Erster Absatz WortEins.\n\nZweiter Absatz WortZwei.\n' > "$WC_FILE"
+WC_CREATE_FAIL=""; WC_PARENT_OVERRIDE=""; WC_PARENT_OVERRIDE_SET=""; WC_CONTENT_OMIT=""
+
+wc_run() {  # $@ = zusaetzliche Optionen (z. B. --parent X)
+  : > "$WC_CREATE_OUT"
+  PATH="$WC:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+    TEAMCTL_WIKI_AS='selftest@selftest.invalid' TEAMCTL_SSH_KEY="$WC_KEY" \
+    WC_CREATE_OUT="$WC_CREATE_OUT" WC_CREATE_FAIL="$WC_CREATE_FAIL" \
+    WC_PARENT_OVERRIDE="$WC_PARENT_OVERRIDE" WC_PARENT_OVERRIDE_SET="$WC_PARENT_OVERRIDE_SET" \
+    WC_CONTENT_OMIT="$WC_CONTENT_OMIT" \
+    bash "$TEAMCTL" wiki create --space sp-1 --title 'Neue Seite' --file "$WC_FILE" "$@"
+}
+
+# 12a) create --parent: Exit 0, Seiten-ID auf stdout, parentPageId im Body.
+cout="$(wc_run --parent 'parent-x' 2>&1)"; crc=$?
+cbody="$(cat "$WC_CREATE_OUT" 2>/dev/null)"
+if [ "$crc" -ne 0 ]; then
+  fail "wiki create --parent (Verifikations-Haertung): Exit != 0 (war $crc)"
+  printf '%s\n' "$cout" | sed 's/^/      /' >&2
+elif [ "$cout" != "pg-new" ]; then
+  fail "wiki create --parent (Verifikations-Haertung): Seiten-ID fehlt (Ausgabe '$cout')"
+elif ! printf '%s' "$cbody" | grep -q '"parentPageId":"parent-x"'; then
+  fail "wiki create --parent (Verifikations-Haertung): create ohne Ziel-Parent"
+else
+  pass "wiki create --parent (Verifikations-Haertung): Exit 0, ID + parentPageId gesetzt"
+fi
+
+# 12b) Read-back-Schutz: parentPageId weicht ab -> Abbruch.
+WC_PARENT_OVERRIDE_SET=1; WC_PARENT_OVERRIDE='parent-anders'
+bout="$(wc_run --parent 'parent-x' 2>&1)"; brc=$?
+WC_PARENT_OVERRIDE_SET=""; WC_PARENT_OVERRIDE=""
+if [ "$brc" -eq 0 ]; then
+  fail "wiki create --parent (Read-back, Verifikations-Haertung): Exit 0 trotz falschem Parent"
+elif ! printf '%s' "$bout" | grep -q 'Verifikation'; then
+  fail "wiki create --parent (Read-back, Verifikations-Haertung): keine Verifikationsmeldung"
+  printf '%s\n' "$bout" | sed 's/^/      /' >&2
+else
+  pass "wiki create --parent (Read-back, Verifikations-Haertung): parentPageId-Mismatch -> Abbruch (Exit $brc)"
+fi
+
+# 12c) create ohne --parent: keine Parent-Pruefung, Exit 0.
+nout2="$(wc_run 2>&1)"; nrc2=$?
+if [ "$nrc2" -ne 0 ]; then
+  fail "wiki create ohne --parent (Verifikations-Haertung): Exit != 0 (war $nrc2)"
+  printf '%s\n' "$nout2" | sed 's/^/      /' >&2
+elif [ "$nout2" != "pg-new" ]; then
+  fail "wiki create ohne --parent (Verifikations-Haertung): Ausgabe '$nout2'"
+else
+  pass "wiki create ohne --parent (Verifikations-Haertung): Exit 0, keine Parent-Pruefung"
+fi
+
+# 12d) Inhalts-Read-back: ein Wort-Token fehlt -> Abbruch.
+WC_CONTENT_OMIT='WortZwei'
+dout2="$(wc_run 2>&1)"; drc2=$?
+WC_CONTENT_OMIT=""
+if [ "$drc2" -eq 0 ]; then
+  fail "wiki create (Inhalts-Read-back, Verifikations-Haertung): Exit 0 trotz fehlendem Inhalt"
+elif ! printf '%s' "$dout2" | grep -q 'Verifikation'; then
+  fail "wiki create (Inhalts-Read-back, Verifikations-Haertung): keine Verifikationsmeldung"
+  printf '%s\n' "$dout2" | sed 's/^/      /' >&2
+else
+  pass "wiki create (Inhalts-Read-back, Verifikations-Haertung): fehlendes Wort-Token -> Abbruch (Exit $drc2)"
+fi
+
+# 12e) create mit leerem Inhalt (nur Satzzeichen) -> Fehler (nichts pruefbar).
+EMPTYF="$WORK/empty-content.md"
+printf -- '---\n***\n\n' > "$EMPTYF"
+eout2="$(PATH="$WC:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+  TEAMCTL_WIKI_AS='selftest@selftest.invalid' TEAMCTL_SSH_KEY="$WC_KEY" \
+  WC_CREATE_OUT="$WORK/wc.create2" WC_CREATE_FAIL='' WC_PARENT_OVERRIDE='' \
+  WC_PARENT_OVERRIDE_SET='' WC_CONTENT_OMIT='' \
+  bash "$TEAMCTL" wiki create --space sp-1 --title 'Leer' --file "$EMPTYF" 2>&1)"; erc2=$?
+if [ "$erc2" -eq 0 ]; then
+  fail "wiki create (leerer Inhalt, Verifikations-Haertung): Exit 0 trotz leerer Probe"
+elif ! printf '%s' "$eout2" | grep -q 'nicht moeglich'; then
+  fail "wiki create (leerer Inhalt, Verifikations-Haertung): keine klare Meldung"
+  printf '%s\n' "$eout2" | sed 's/^/      /' >&2
+else
+  pass "wiki create (leerer Inhalt, Verifikations-Haertung): leerer Inhalt -> Abbruch (Exit $erc2)"
+fi
+
+# 12f) update: Markdown-Umserialisierung (Tabellen-Padding, _x_ statt *x*,
+# eingerueckte Zeilen) darf den vollstaendigen Inhaltsvergleich nicht scheitern lassen.
+MDF="$WORK/md-rewrite.md"
+printf '%s\n' '## Titel Zwei' '' '**fett** und *kursiv*' '' '| a | b |' '| - | - |' '| 1 | 2 |' '' '  eingerueckt' > "$MDF"
+MD_REMOTE='## Titel Zwei
+
+**fett** und _kursiv_
+
+|     |     |
+| --- | --- |
+| a   | b   |
+| 1   | 2   |
+
+eingerueckt'
+fout2="$(PATH="$WP:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+  TEAMCTL_WIKI_AS='selftest@selftest.invalid' TEAMCTL_SSH_KEY="$WP_KEY" \
+  WP_LOG="$WP_LOG" WP_UPD="$WP_UPD" WP_PARENT="$WP_PARENT" WP_PAGE="$WP_PAGE" \
+  WP_CONTENT="$MD_REMOTE" WP_MOVE_FAIL='' WP_MOVE_NOOP='' \
+  bash "$TEAMCTL" wiki update "$WP_PAGE" --file "$MDF" 2>&1)"; frc2=$?
+if [ "$frc2" -ne 0 ]; then
+  fail "wiki update (Norm-Vergleich, Verifikations-Haertung): Exit != 0 (war $frc2)"
+  printf '%s\n' "$fout2" | sed 's/^/      /' >&2
+else
+  pass "wiki update (Norm-Vergleich, Verifikations-Haertung): Markdown-Umserialisierung -> Exit 0"
+fi
+
+# 12g) update: ein Wort-Token fehlt im Read-back -> Abbruch (statt Zufallstoken).
+MF="$WORK/missing-token.md"
+printf '%s\n' 'Zeile EINS mit WortAlpha' 'Zeile ZWEI mit WortBeta' > "$MF"
+gout="$(PATH="$WP:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+  TEAMCTL_WIKI_AS='selftest@selftest.invalid' TEAMCTL_SSH_KEY="$WP_KEY" \
+  WP_LOG="$WP_LOG" WP_UPD="$WP_UPD" WP_PARENT="$WP_PARENT" WP_PAGE="$WP_PAGE" \
+  WP_CONTENT='Zeile EINS mit WortAlpha' WP_MOVE_FAIL='' WP_MOVE_NOOP='' \
+  bash "$TEAMCTL" wiki update "$WP_PAGE" --file "$MF" 2>&1)"; grc=$?
+if [ "$grc" -eq 0 ]; then
+  fail "wiki update (Inhalts-Read-back, Verifikations-Haertung): Exit 0 trotz fehlendem Token"
+elif ! printf '%s' "$gout" | grep -q 'Verifikation'; then
+  fail "wiki update (Inhalts-Read-back, Verifikations-Haertung): keine Verifikationsmeldung"
+  printf '%s\n' "$gout" | sed 's/^/      /' >&2
+else
+  pass "wiki update (Inhalts-Read-back, Verifikations-Haertung): fehlendes Token -> Abbruch (Exit $grc)"
+fi
+
+# 12h) update: leerer Inhalt -> Fehler (frueher: Verifikation still uebersprungen).
+hout="$(PATH="$WP:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+  TEAMCTL_WIKI_AS='selftest@selftest.invalid' TEAMCTL_SSH_KEY="$WP_KEY" \
+  WP_LOG="$WP_LOG" WP_UPD="$WP_UPD" WP_PARENT="$WP_PARENT" WP_PAGE="$WP_PAGE" \
+  WP_CONTENT='x' WP_MOVE_FAIL='' WP_MOVE_NOOP='' \
+  bash "$TEAMCTL" wiki update "$WP_PAGE" --file "$EMPTYF" 2>&1)"; hrc=$?
+if [ "$hrc" -eq 0 ]; then
+  fail "wiki update (leerer Inhalt, Verifikations-Haertung): Exit 0 trotz leerer Probe"
+elif ! printf '%s' "$hout" | grep -q 'nicht moeglich'; then
+  fail "wiki update (leerer Inhalt, Verifikations-Haertung): keine klare Meldung"
+  printf '%s\n' "$hout" | sed 's/^/      /' >&2
+else
+  pass "wiki update (leerer Inhalt, Verifikations-Haertung): leerer Inhalt -> Abbruch (Exit $hrc)"
+fi
+
 # --- Ergebnis ---------------------------------------------------------------
 if [ "$FAILS" -gt 0 ]; then
   printf 'FAIL: %d Test(s) fehlgeschlagen\n' "$FAILS" >&2

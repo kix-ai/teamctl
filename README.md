@@ -91,6 +91,8 @@ WIKI (Docmost)
     teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
     (optional ueberall: --as <email|name>)
     (wiki update --parent <pageId> haengt die Seite um; --parent '' loest sie auf Root)
+    (wiki create/update verifizieren Titel, --parent-parentPageId und den
+     gesamten Inhalt normalisiert; leerer Inhalt = Fehler -- siehe unten)
 
 BLOG (statische Seite auf dem Host)
 
@@ -250,6 +252,28 @@ ausschliesslich der Titel durchsucht.
   So faellt ein stilles Ignorieren des Umhaengens sofort auf.
 - Der Inhalt wird wie bisher per `pages/update` geschrieben; `--parent` steht
   nur beim Umhaengen. Ohne `--parent` aendert `wiki update` den Parent nicht.
+
+## Read-back-Verifikation: `wiki create` / `wiki update`
+
+Jeder Schreibvorgang wird anschliessend per `pages/info` gegen den Soll-Zustand
+geprueft; bei Abweichung folgt eine Meldung und **Exit != 0**.
+
+- **Titel** (nur `create`): der zurueckgelesene Titel muss dem `--title` entsprechen.
+- **parentPageId** (`create --parent` und `update --parent`): die zurueckgelesene
+  Eltern-Zuordnung muss dem Ziel entsprechen (`--parent ''` = Root/null). Damit
+  faellt ein stilles Ignorieren sofort auf (Issue #22 und die gleiche blinde
+  Stelle beim Anlegen).
+- **Inhalt** (vollstaendig/normalisiert): **alle** Wort-Token der lokalen Datei
+  muessen in der gespeicherten Markdown-Fassung vorkommen (Multimenge,
+  Reihenfolge egal) - nicht nur ein zufaelliges Einzel-Token. Der Vergleich
+  normalisiert bewusst die Markdown-Umserialisierung des Wikis (Zeilenenden,
+  Einrueckung, Tabellen-Ausrichtung, `*x*` vs. `_x_`), prueft aber den gesamten
+  Inhalt. Fehlt ein Token, wird wegen Eventual Consistency bis zu 4-mal
+  wiederholt (Pausen 1s/2s/3s) und dann mit knapper Meldung (Anzahl + Beispiele)
+  abgebrochen.
+- **Leerer Inhalt = Fehler:** enthaelt die Datei kein pruefbares Wort-Token
+  (leer oder nur Satzzeichen), bricht der Read-back mit klarer Meldung ab statt
+  die Verifikation still zu ueberspringen.
 
 ## Ausgabe und Fehler
 

@@ -306,6 +306,10 @@ Hinweis:
   teamctl wiki update --parent <pageId> haengt eine bestehende Seite um
   (pages/move + Read-back); --parent '' loest sie vom Parent auf Root. Ohne
   --parent bleibt der Parent unveraendert.
+  teamctl wiki create/update pruefen den Read-back: Titel, bei --parent auch
+  parentPageId und den GESAMTEN Inhalt normalisiert (alle Wort-Token; die
+  Markdown-Umserialisierung des Wikis, z. B. Tabellen-Ausrichtung, *x*/_x_,
+  Einrueckung, ist toleriert). Ein Inhalt ohne pruefbares Wort = Fehler.
   teamctl ist ueber einen Symlink in einem PATH-Verzeichnis (z. B. ~/.local/bin)
   auch ohne vollen Pfad als "teamctl" aufrufbar. Bei HTTP 429 (Too Many Requests)
   wiederholt teamctl Wiki-Aufrufe automatisch mit exponentiellem Backoff + Jitter
@@ -358,6 +362,49 @@ wiki_err() { printf '%s' "$WIKI_BODY" | jq -r '.message // .error // empty' 2>/d
 
 wiki_api_or_die() {
   wiki_api "$1" "$2" || { note "Wiki: HTTP $WIKI_HTTP bei POST /api/$1: $(wiki_err)"; return 1; }
+}
+
+# wiki_words - normalisierte Wortliste eines Textes (ein Token pro Zeile, sortiert).
+# Liest stdin. Alles ausserhalb [[:alnum:]] trennt; damit ist der Vergleich
+# unabhaengig von der Markdown-Umserialisierung des Wikis (Zeilenenden,
+# Einrueckung, Tabellen-Ausrichtung, *x* vs. _x_).
+wiki_words() {
+  LC_ALL=C.UTF-8 grep -oE '[[:alnum:]]+' 2>/dev/null | LC_ALL=C sort || true
+}
+
+# wiki_verify_content <pageId> <datei> <kontext>
+# Vollstaendiger, normalisierter Inhalts-Read-back statt eines zufaelligen
+# Einzel-Tokens: JEDES Wort-Token der lokalen Datei muss in der gespeicherten
+# Fassung (pages/info, format=markdown) enthalten sein - als Multimenge,
+# Reihenfolge egal. Fehlt auch nur ein Token, schlaegt die Verifikation fehl
+# (Exit != 0) mit knapper Meldung (Anzahl + Beispiele). Ein Inhalt ganz ohne
+# pruefbares Wort-Token (leer/nur Satzzeichen) ist ein Fehler, weil dann nichts
+# verifizierbar ist. Der Read-back direkt nach dem Schreiben kann veralteten
+# Inhalt liefern (Eventual Consistency); daher begrenzt wiederholen (max 4
+# Versuche, Pausen 1s/2s/3s), bevor gemeldet wird.
+wiki_verify_content() {
+  local page="$1" file="$2" ctx="$3"
+  local lf rf content missing attempt ntokens
+  lf="$(mktmp)"; rf="$(mktmp)"
+  wiki_words < "$file" > "$lf"
+  if [ ! -s "$lf" ]; then
+    die "$ctx: Verifikation nicht moeglich (Inhalt ohne pruefbares Wort, id=$page)"
+  fi
+  attempt=1
+  while :; do
+    wiki_api_or_die "pages/info" \
+      "$(jq -nc --arg p "$page" '{pageId:$p, format:"markdown", includeContent:true}')" \
+      || die "$ctx: Read-back fehlgeschlagen (id=$page)"
+    content="$(printf '%s' "$WIKI_BODY" | jq -r '.data.content // ""')"
+    printf '%s' "$content" | wiki_words > "$rf"
+    missing="$(LC_ALL=C comm -23 "$lf" "$rf")"
+    if [ -z "$missing" ]; then return 0; fi
+    [ "$attempt" -ge 4 ] && break
+    sleep "$attempt"
+    attempt=$(( attempt + 1 ))
+  done
+  ntokens="$(printf '%s\n' "$missing" | wc -l | tr -d ' ')"
+  die "$ctx: Verifikation fehlgeschlagen ($ntokens Wort-Token fehlen, z. B. $(printf '%s' "$missing" | head -3 | tr '\n' ' '), id=$page)"
 }
 
 wiki_fetch_sidebar() {
@@ -530,12 +577,12 @@ wiki_get() {
 }
 
 wiki_create() {
-  local space="" title="" file="" parent="" body id rt
+  local space="" title="" file="" parent="" parent_set=0 body id rt rp
   while [ $# -gt 0 ]; do case "$1" in
     --space)  [ $# -ge 2 ] || die "wiki create: --space braucht einen Wert"; space="$2"; shift 2 ;;
     --title)  [ $# -ge 2 ] || die "wiki create: --title braucht einen Wert"; title="$2"; shift 2 ;;
     --file)   [ $# -ge 2 ] || die "wiki create: --file braucht einen Wert"; file="$2"; shift 2 ;;
-    --parent) [ $# -ge 2 ] || die "wiki create: --parent braucht einen Wert"; parent="$2"; shift 2 ;;
+    --parent) [ $# -ge 2 ] || die "wiki create: --parent braucht einen Wert"; parent="$2"; parent_set=1; shift 2 ;;
     --as)     [ $# -ge 2 ] || die "wiki create: --as braucht einen Wert"; WIKI_AS="$2"; shift 2 ;;
     *) die "wiki create: unbekannte Option '$1'" ;;
   esac; done
@@ -555,6 +602,14 @@ wiki_create() {
   wiki_api_or_die "pages/info" "$(jq -nc --arg p "$id" '{pageId:$p}')"
   rt="$(printf '%s' "$WIKI_BODY" | jq -r '.data.title // empty')"
   [ "$rt" = "$title" ] || die "wiki create: Verifikation fehlgeschlagen (Titel '$rt' != '$title', id=$id)"
+  # --parent wird - wie bei 'wiki update' - gegen parentPageId geprueft: nur den
+  # Titel zu verifizieren war die gleiche blinde Stelle wie Issue #22.
+  if [ "$parent_set" -eq 1 ]; then
+    rp="$(printf '%s' "$WIKI_BODY" | jq -r '.data.parentPageId // empty')"
+    [ "$rp" = "$parent" ] || die "wiki create: Verifikation fehlgeschlagen (parentPageId '${rp:-null}' != '${parent:-null}', id=$id)"
+  fi
+  # Inhalt vollstaendig/normalisiert verifizieren (nicht nur den Titel).
+  wiki_verify_content "$id" "$file" "wiki create"
   printf '%s\n' "$id"
 }
 
@@ -621,7 +676,7 @@ wiki_reparent() {
 wiki_update() {
   [ $# -ge 1 ] || die "wiki update: <pageId> fehlt"
   local page="$1"; shift
-  local file="" mode="replace" parent="" parent_set=0 body content probe attempt
+  local file="" mode="replace" parent="" parent_set=0 body
   while [ $# -gt 0 ]; do case "$1" in
     --file) [ $# -ge 2 ] || die "wiki update: --file braucht einen Wert"; file="$2"; shift 2 ;;
     --mode) [ $# -ge 2 ] || die "wiki update: --mode braucht einen Wert"; mode="$2"; shift 2 ;;
@@ -642,21 +697,10 @@ wiki_update() {
   if [ "$parent_set" -eq 1 ]; then
     wiki_reparent "$page" "$parent"
   fi
-  probe="$(grep -oE '[A-Za-z0-9]{6,}' "$file" | head -1)"
-  if [ -n "$probe" ]; then
-    # Der Read-back direkt nach pages/update kann noch veralteten Inhalt
-    # liefern (Eventual Consistency). Daher begrenzt wiederholen (max 4
-    # Versuche, Pausen 1s/2s/3s), bevor gemeldet wird - nur EINE Meldung.
-    attempt=1
-    while :; do
-      wiki_api_or_die "pages/info" "$(jq -nc --arg p "$page" '{pageId:$p, format:"markdown", includeContent:true}')"
-      content="$(printf '%s' "$WIKI_BODY" | jq -r '.data.content // ""')"
-      printf '%s' "$content" | grep -qF "$probe" && break
-      [ "$attempt" -ge 4 ] && die "wiki update: Verifikation fehlgeschlagen ('$probe' fehlt, id=$page)"
-      sleep "$attempt"
-      attempt=$(( attempt + 1 ))
-    done
-  fi
+  # Vollstaendiger, normalisierter Inhalts-Read-back: ALLE Wort-Token der Datei
+  # muessen in der gespeicherten Fassung vorkommen (statt eines zufaelligen
+  # Einzel-Tokens). Ein leerer Inhalt ist ein Fehler.
+  wiki_verify_content "$page" "$file" "wiki update"
   printf 'OK\t%s\t%s\n' "$page" "$mode"
 }
 

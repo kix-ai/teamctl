@@ -97,6 +97,23 @@ Titel, Body und Tags-Zeile - also auch Begriffe, die nur im Inhalt stehen.
 - Read-back per `pages/info`: `parentPageId` muss dem Ziel entsprechen, sonst
   Fehler und Exit != 0. Ohne `--parent` bleibt der Parent unveraendert.
 
+## Wiki verifizieren: `wiki create` / `wiki update`
+
+Jeder Schreibvorgang prueft den Read-back (`pages/info`); bei Abweichung:
+Meldung + Exit != 0.
+
+- **Titel** (`create`): muss dem `--title` entsprechen.
+- **parentPageId** (`create --parent`, `update --parent`): muss dem Ziel
+  entsprechen (`--parent ''` = Root/null).
+- **Inhalt** (vollstaendig/normalisiert): ALLE Wort-Token der Datei muessen in
+  der gespeicherten Markdown-Fassung vorkommen (Multimenge; Reihenfolge egal).
+  Die Markdown-Umserialisierung des Wikis (Zeilenenden, Einrueckung,
+  Tabellen-Ausrichtung, `*x*` vs. `_x_`) wird toleriert - geprueft wird der
+  gesamte Inhalt, nicht ein zufaelliges Einzel-Token. Fehlt ein Token, folgen
+  bis zu 4 Versuche (Pausen 1s/2s/3s) wegen Eventual Consistency.
+- **Leerer Inhalt = Fehler**: kein pruefbares Wort-Token (leer/nur Satzzeichen)
+  -> Abbruch statt stiller Ueberspringung.
+
 ## Konventionen
 
 - Datenausgabe TAB-getrennt und maschinenlesbar; Statuszeilen auf stderr.
