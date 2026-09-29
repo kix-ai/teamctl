@@ -301,8 +301,11 @@ WIKI (Docmost)
 
 BLOG (statische Seite auf dem Infra-Host)
   teamctl blog list
-  teamctl blog publish --file <html> --slug <slug>
+  teamctl blog publish --file <html> --slug <slug> [--title <T>] [--link|--no-link]
   teamctl blog link --title <T> --slug <slug>
+  (publish haengt den Post standardmaessig in index.html ein und prueft das
+   per Read-back; --no-link ueberspringt die Einhaengung mit Warnhinweis;
+   --title setzt den Index-Titel, sonst wird <title> aus der Datei genommen)
 
 GIT (GitHub, Konto per Token)
   teamctl git info <repo>
@@ -1064,11 +1067,41 @@ remote_rm() {
   return 0
 }
 
+# blog_extract_title <datei> - liest den <title>-Text aus einer HTML-Datei,
+# entfernt Tags, entschaerft Entities und normalisiert Leerraum (leer bei
+# Fehler). Reines Lesen vom lokalen Dateisystem, keine Shell-Auswertung.
+blog_extract_title() {
+  local file="${1:-}" t=""
+  [ -f "$file" ] || return 1
+  t="$(python3 - "$file" <<'PY'
+import re, sys, html
+try:
+    doc = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+except OSError:
+    sys.exit(1)
+m = re.search(r'<title[^>]*>(.*?)</title>', doc, re.IGNORECASE | re.DOTALL)
+if not m:
+    sys.exit(1)
+t = re.sub('<[^>]+>', '', m.group(1))
+t = html.unescape(t)
+t = ' '.join(t.split())
+if not t:
+    sys.exit(1)
+sys.stdout.write(t)
+PY
+)" || return 1
+  [ -n "$t" ] || return 1
+  printf '%s' "$t"
+}
+
 blog_publish() {
-  local file="" slug="" tmp out remote_size remote_hash local_size local_hash
+  local file="" slug="" title="" link=1 tmp out remote_size remote_hash local_size local_hash
   while [ $# -gt 0 ]; do case "$1" in
     --file) [ $# -ge 2 ] || die "blog publish: --file braucht einen Wert"; file="$2"; shift 2 ;;
     --slug) [ $# -ge 2 ] || die "blog publish: --slug braucht einen Wert"; slug="$2"; shift 2 ;;
+    --title) [ $# -ge 2 ] || die "blog publish: --title braucht einen Wert"; title="$2"; shift 2 ;;
+    --link) link=1; shift ;;
+    --no-link) link=0; shift ;;
     *) die "blog publish: unbekannte Option '$1'" ;;
   esac; done
   [ -n "$file" ] || die "blog publish: --file fehlt"
@@ -1089,6 +1122,27 @@ blog_publish() {
   [ "$remote_hash" = "$local_hash" ] || die "blog publish: Verifikation fehlgeschlagen (sha256 remote=$remote_hash lokal=$local_hash)"
   [ "$remote_size" = "$local_size" ] || die "blog publish: Verifikation fehlgeschlagen (remote=$remote_size lokal=$local_size)"
   printf 'OK\t/posts/%s.html\t%s\n' "$slug" "$remote_size"
+  # Index-Einhaengung (Default): ohne Eintrag in index.html ist der Post nur per
+  # Direkt-URL erreichbar - daher nach dem Publish standardmaessig verlinken.
+  if [ "$link" -eq 0 ]; then
+    note "blog publish: --no-link - Index-Einhaengung uebersprungen."
+    note "blog publish: Post '$slug' ist NICHT in der Indexseite verlinkt. Nachziehen mit: teamctl blog link --title '<Titel>' --slug $slug"
+    return 0
+  fi
+  if [ -z "$title" ]; then
+    title="$(blog_extract_title "$file" || true)"
+  fi
+  if [ -z "$title" ]; then
+    die "blog publish: Post '$slug' wurde veroeffentlicht, aber kein Titel gefunden (weder --title noch <title> in '$file'). Index-Einhaengung FEHLT. Nachziehen mit: teamctl blog link --title '<Titel>' --slug $slug"
+  fi
+  local ln_out
+  if ln_out="$(blog_link --title "$title" --slug "$slug" 2>&1)"; then
+    printf '%s\n' "$ln_out"
+    note "blog publish: Index-Einhaengung fuer '$slug' verifiziert (Read-back)."
+  else
+    printf '%s\n' "$ln_out" >&2
+    die "blog publish: Post '$slug' ist veroeffentlicht, aber die Index-Einhaengung ist FEHLGESCHLAGEN. Nachziehen mit: teamctl blog link --title '$title' --slug $slug"
+  fi
 }
 
 blog_link() {

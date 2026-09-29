@@ -103,8 +103,11 @@ WIKI (Docmost)
 BLOG (statische Seite auf dem Host)
 
     teamctl blog list
-    teamctl blog publish --file <html> --slug <slug>
+    teamctl blog publish --file <html> --slug <slug> [--title <T>] [--link|--no-link]
     teamctl blog link --title <T> --slug <slug>
+    (publish haengt den Post standardmaessig in index.html ein und verifiziert
+     den Eintrag per Read-back; --no-link uebersprungen = Warnhinweis;
+     --title setzt den Index-Titel, sonst wird <title> aus der Datei gelesen)
 
 GIT (GitHub, Konto per Token)
 
@@ -392,7 +395,11 @@ teamctl doctor
   (N1: keine vorhersagbaren `/tmp/teamctl_*_$$`-Namen) und verifizieren
   `blog publish` ueber den `sha256`-Hash der ausgelieferten Datei (N3), nicht
   nur ueber die Byte-Anzahl. `blog link` verifiziert die Link-Anzahl in
-  `index.html`.
+  `index.html`. `blog publish` haengt den Post zusaetzlich standardmaessig in
+  die Indexseite ein (Auto-Link) und prueft den Eintrag per Read-back;
+  `--no-link` ueberspringt das mit deutlichem Warnhinweis, `--link` erzwingt es
+  explizit. Ohne Titel (weder `--title` noch `<title>` in der Datei) bricht
+  `blog publish` nach dem Upload mit klarer Meldung + `blog link`-Hinweis ab.
 - `wiki export` legt Manifest- und Datei-Temp im Zielverzeichnis an, damit das
   abschliessende `mv` innerhalb desselben Dateisystems atomar bleibt (N4);
   Manifest-Felder werden von echten Tabs/CR/LF befreit (`wex_tsv`), damit die
@@ -404,7 +411,11 @@ teamctl doctor
 Shell-Auswertung (`eval`) im Kommandokontext, die Ablehnung von Metazeichen in
 `TEAMCTL_GITHUB_TOKEN_CMD` sowie die Haertungen N1-N6 (Config-Rechte/-Owner,
 Segment-Traversal, remote `mktemp` + `sha256`-Verifikation beim Blog-Publish,
-Body-only-Erstellerkennung, atomarer Wiki-Export):
+Body-only-Erstellerkennung, atomarer Wiki-Export). Zusaetzlich deckt er die
+Blog-Auto-Link-Logik von `blog publish` hermetisch ab (SSH-/SCP-Stubs, kein
+Netz): Default laedt hoch und haengt ein, `--no-link` ueberspringt
+(Warnhinweis), `--title` schlaegt den Datei-`<title>`; fehlender Titel =
+Read-back-Fehler mit `blog link`-Hinweis, `blog link` bleibt idempotent:
 
 ```bash
 bash tests/selftest.sh

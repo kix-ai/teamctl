@@ -21,8 +21,11 @@ WIKI (Docmost)
 BLOG (statische Seite auf dem Host)
 
     teamctl blog list
-    teamctl blog publish --file <html> --slug <slug>
+    teamctl blog publish --file <html> --slug <slug> [--title <T>] [--link|--no-link]
     teamctl blog link --title <T> --slug <slug>
+    (publish haengt den Post standardmaessig in index.html ein und verifiziert
+     den Eintrag per Read-back; --no-link uebersprungen = Warnhinweis;
+     --title setzt den Index-Titel, sonst wird <title> aus der Datei gelesen)
 
 GIT (GitHub, Token aus der Konfiguration)
 

@@ -1554,6 +1554,140 @@ else
   fail "N4: Temp nicht im Zielverzeichnis erzeugt"
 fi
 
+# --- 18) blog publish: Auto-Link der Index-Einhaengung (Default) -------------
+# Hermetisch: SSH-/SCP-Stubs fuehren das "Remote"-Kommando lokal gegen ein
+# Wegwerf-Blogroot aus; kein Netz, kein Key, kein Token.
+BLOG_BIN="$WORK/bin-blog"
+mkdir -p "$BLOG_BIN"
+cat > "$BLOG_BIN/ssh" <<'SSHSTUB'
+#!/usr/bin/env bash
+# ssh-Stub: Optionen ueberspringen, dann (Host weg, Kommando lokal ausfuehren).
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i|-o|-P) shift 2 ;;
+    -*) shift ;;
+    *) shift; break ;;
+  esac
+done
+[ $# -gt 0 ] || exit 0
+exec bash -c "$*"
+SSHSTUB
+cat > "$BLOG_BIN/scp" <<'SCPSTUB'
+#!/usr/bin/env bash
+# scp-Stub: Optionen ueberspringen, letzte zwei Args = Quelle/Ziel, lokal cp.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i|-o|-P) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+[ $# -ge 2 ] || exit 1
+src=""; dst=""
+while [ $# -gt 0 ]; do src="$dst"; dst="$1"; shift; done
+[ -n "$src" ] || exit 1
+src="$(printf '%s' "$src" | sed 's/^[^:]*://')"
+dst="$(printf '%s' "$dst" | sed 's/^[^:]*://')"
+cp -f "$src" "$dst"
+SCPSTUB
+chmod +x "$BLOG_BIN/ssh" "$BLOG_BIN/scp"
+
+BLOGROOT="$WORK/blogroot"
+mkdir -p "$BLOGROOT/posts"
+cat > "$BLOGROOT/index.html" <<'HTML'
+<html><body><ul>
+    <li><a href="/posts/existing.html">Existing</a></li>
+</ul></body></html>
+HTML
+BLOGKEY="$WORK/blogkey"
+: > "$BLOGKEY"; chmod 600 "$BLOGKEY"
+
+BLOGENV="$WORK/blog.env"
+cat > "$BLOGENV" <<ENV
+TEAMCTL_INFRA_HOST=selftest.invalid
+TEAMCTL_WIKI_URL=https://selftest.invalid
+TEAMCTL_WIKI_EMAIL=selftest@selftest.invalid
+TEAMCTL_BLOG_ROOT=$BLOGROOT
+TEAMCTL_SSH_KEY=$BLOGKEY
+TEAMCTL_GIT_OWNER=selftest-owner
+TEAMCTL_GIT_API=https://selftest.invalid/api
+ENV
+chmod 600 "$BLOGENV"
+
+blog_run() {
+  PATH="$BLOG_BIN:$PATH" TEAMCTL_ENV_FILE="$BLOGENV" bash "$TEAMCTL" blog "$@" 2>&1
+}
+
+POST1="$WORK/post1.html"
+cat > "$POST1" <<'HTML'
+<html><head><title>  SOC Report &amp; Findings </title></head>
+<body><h1>SOC</h1></body></html>
+HTML
+
+# 18a) Default: veroeffentlicht UND verlinkt (Titel aus der Datei).
+out18="$(blog_run publish --file "$POST1" --slug soc-blog)"
+rc18=$?
+if [ "$rc18" -eq 0 ] \
+   && printf '%s' "$out18" | grep -q 'Read-back' \
+   && grep -qF 'href="/posts/soc-blog.html"' "$BLOGROOT/index.html" \
+   && grep -qF 'SOC Report &amp; Findings' "$BLOGROOT/index.html"; then
+  pass "18a: blog publish verlinkt standardmaessig (Titel aus <title>)"
+else
+  fail "18a: Auto-Link Standard fehlt (rc=$rc18, out=$out18)"
+fi
+
+# 18b) Idempotenz: zweiter Publish dupliziert den Link nicht.
+blog_run publish --file "$POST1" --slug soc-blog >/dev/null
+n18b="$(grep -c 'href="/posts/soc-blog.html"' "$BLOGROOT/index.html" || true)"
+if [ "$n18b" -eq 1 ]; then
+  pass "18b: blog publish ist idempotent (Link genau einmal)"
+else
+  fail "18b: Link dupliziert (n=$n18b)"
+fi
+
+# 18c) --no-link: kein Eintrag + deutlicher Warnhinweis auf 'blog link'.
+out18c="$(blog_run publish --file "$POST1" --slug no-link-case --no-link)"
+rc18c=$?
+if [ "$rc18c" -eq 0 ] \
+   && ! grep -qF 'href="/posts/no-link-case.html"' "$BLOGROOT/index.html" \
+   && printf '%s' "$out18c" | grep -q 'blog link'; then
+  pass "18c: --no-link ueberspringt die Einhaengung mit Warnhinweis"
+else
+  fail "18c: --no-link falsch (rc=$rc18c)"
+fi
+
+# 18d) --title schlaegt den Datei-<title>.
+blog_run publish --file "$POST1" --slug titled --title "Eigener Titel" >/dev/null
+if grep -qF '>Eigener Titel</a>' "$BLOGROOT/index.html"; then
+  pass "18d: --title setzt den Index-Titel"
+else
+  fail "18d: --title nicht uebernommen"
+fi
+
+# 18e) Kein Titel moeglich: Upload ok, aber klarer Fehler + Hinweis, kein Eintrag.
+POSTNT="$WORK/post_no_title.html"
+cat > "$POSTNT" <<'HTML'
+<html><body><h1>ohne Titel</h1></body></html>
+HTML
+out18e="$(blog_run publish --file "$POSTNT" --slug no-title)"
+rc18e=$?
+if [ "$rc18e" -ne 0 ] \
+   && printf '%s' "$out18e" | grep -q 'blog link' \
+   && ! grep -qF 'href="/posts/no-title.html"' "$BLOGROOT/index.html" \
+   && [ -f "$BLOGROOT/posts/no-title.html" ]; then
+  pass "18e: fehlender Titel = Upload ok + Fehler mit blog link-Hinweis"
+else
+  fail "18e: fehlender Titel falsch behandelt (rc=$rc18e)"
+fi
+
+# 18f) blog link bleibt idempotent (SKIP bei vorhandenem Eintrag).
+out18f="$(blog_run link --title 'SOC Report & Findings' --slug soc-blog)"
+if printf '%s' "$out18f" | grep -q 'SKIP'; then
+  pass "18f: blog link ist idempotent (SKIP)"
+else
+  fail "18f: blog link nicht idempotent ($out18f)"
+fi
+
 # --- Ergebnis ---------------------------------------------------------------
 if [ "$FAILS" -gt 0 ]; then
   printf 'FAIL: %d Test(s) fehlgeschlagen\n' "$FAILS" >&2
