@@ -14,7 +14,7 @@ WIKI (Docmost)
     teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
     teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>|--parent '']
     teamctl wiki upload <pageId> <bilddatei>
-    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
+    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
     teamctl wiki me
     teamctl wiki profile --name <name>
 
@@ -54,11 +54,14 @@ Exportiert alle Docmost-Seiten (oder mit `--space <spaceId>` nur einen Space)
 als Markdown: eine Datei je Seite `<space-slug>__<page-slug>.md` mit
 YAML-Kopfzeile (`title`, `space`, `spaceId`, `pageId`).
 
-    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
+    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
 
 - Default-Ziel: `WIKI_EXPORT_DIR`, sonst `~/.openclaw/wiki`.
 - Idempotent ueber ein Manifest (`.wiki-sync-manifest.tsv`); im Wiki geloeschte
-  Seiten werden aus dem Ziel entfernt (ausser mit `--no-prune`).
+  Export-Dateien entfernt das Pruning. Per Default nur Dateien im Export-Schema
+  `<space>__<page>[-<pid8>].md` (fremde `*.md` im Ziel bleiben erhalten);
+  aggressiv ALLE nicht im Manifest stehenden `*.md` nur mit `--prune`;
+  `--no-prune` deaktiviert das Pruning ganz.
 - `--dry-run` zeigt nur die Aenderungen, `--quiet` unterdrueckt den Fortschritt.
 - Zugangsdaten kommen aus der teamctl-Konfiguration (`TEAMCTL_WIKI_*`) und
   werden nie ausgegeben oder in die Export-Dateien geschrieben.
@@ -150,4 +153,9 @@ TEAMCTL_RETRY_MAX, TEAMCTL_RETRY_BASE, TEAMCTL_RETRY_CAP.
 
 TLS fuer das Wiki: TEAMCTL_WIKI_CA (Pfad zum CA-/Leaf-Zertifikat).
 Der Zustand wird beim Start geprueft; fehlt/leer/unlesbar/kein PEM -> sofortiger
-Abbruch mit klarer Meldung. Ohne den Wert gilt die System-CA.
+Abbruch mit klarer Meldung. Gesetzt: Wiki-Aufrufe verifizieren ueber `--cacert`
+(kein `-k`). Ohne den Wert laufen Wiki-Aufrufe mit `-k` (TLS-Verifikation AUS,
+nur fuer die selbstsignierte Infrastruktur).
+
+`--as`/`TEAMCTL_WIKI_AS` wird per Whitelist validiert (Buchstaben, Ziffern,
+`. _ @ + -`, Leerzeichen); in ssh-Aufrufen wird der Wert remote single-quoted.

@@ -103,7 +103,10 @@ require_config() {
   require_https TEAMCTL_WIKI_URL "$WIKI_BASE"  "die URL"
 }
 
-CURL_OPTS=(-sk --max-time 60)
+# curl-Basisoptionen. '-k' (TLS-Verifikation aus) steht bewusst NICHT hier:
+# global gesetzt wuerde es jedes spaetere '--cacert' entwerten (H2). Die
+# TLS-Entscheidung faellt ausschliesslich in wiki_ca_opts (WIKI_CURL_OPTS).
+CURL_OPTS=(-s --max-time 60)
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15)
 
 TOK=""
@@ -131,7 +134,10 @@ WIKI_CURL_OPTS=()
 # verloren und ein Abbruch beendete nur die Subshell (fail-soft).
 # Fehlermeldungen nennen ausschliesslich TEAMCTL_WIKI_CA - nie den Wert/Pfad.
 wiki_ca_opts() {
-  WIKI_CURL_OPTS=()
+  # Ohne TEAMCTL_WIKI_CA bleibt die TLS-Verifikation aus (-k) - nur fuer die
+  # selbstsignierte Infrastruktur noetig und NUR hier gesetzt, nie global in
+  # CURL_OPTS (sonst wuerde ein gesetztes --cacert entwertet, H2).
+  WIKI_CURL_OPTS=(-k)
   if [ -z "$TEAMCTL_WIKI_CA" ]; then
     return 0
   fi
@@ -159,6 +165,7 @@ wiki_ca_opts() {
   if ! openssl x509 -in "$TEAMCTL_WIKI_CA" -noout >/dev/null 2>&1; then
     die "TEAMCTL_WIKI_CA: openssl konnte die Datei nicht als Zertifikat lesen."
   fi
+  # CA gesetzt: echte Verifikation ueber --cacert; kein -k hier.
   WIKI_CURL_OPTS=(--cacert "$TEAMCTL_WIKI_CA")
 }
 
@@ -262,7 +269,7 @@ WIKI (Docmost)
   teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
   teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>|--parent '']
   teamctl wiki upload <pageId> <bilddatei>
-  teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
+  teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
   teamctl wiki me
   teamctl wiki profile --name <name>
   (optional ueberall: --as <email|name>   Standard: writer)
@@ -328,17 +335,34 @@ scp_to()   { ssh_ready; scp -q -i "$SSH_KEY" "${SSH_OPTS[@]}" "$1" "$INFRA_HOST:
 scp_from() { ssh_ready; scp -q -i "$SSH_KEY" "${SSH_OPTS[@]}" "$INFRA_HOST:$1" "$2"; }
 
 # ---------------- Wiki (Docmost) ----------------
+
+# shq <text> - Argument fuer die REMOTE-Shell (ssh) sicher in einfache
+# Anfuehrungszeichen setzen. Eingebettete Single-Quotes werden remote maskiert -
+# der Wert kann so nie aus den Quotes ausbrechen (H1: Command-Injection).
+shq() { awk -v s="$1" 'BEGIN{ gsub("\047","\047\134\047\047",s); printf "\047%s\047", s }'; }
+
+# wiki_as_validate <wert> - Whitelist fuer --as/WIKI_AS (H1).
+# Erlaubt nur Buchstaben, Ziffern, '. _ @ + -' und Leerzeichen (Name/Email).
+# Alles andere (Metazeichen wie Quotes, ; & | $, Backticks, Klammern) und
+# Zeilenumbrueche werden abgelehnt; die Meldung nennt nur den Optionsnamen.
+wiki_as_validate() {
+  local who="$1" bad
+  [ -n "$who" ] || die "wiki: --as ist leer"
+  bad="$(printf '%s' "$who" | LC_ALL=C tr -d 'A-Za-z0-9._@+ -' | LC_ALL=C tr -d '\200-\377')"
+  [ -z "$bad" ] || die "wiki: --as ungueltig - erlaubt sind nur Buchstaben, Ziffern, . _ @ + - und Leerzeichen"
+}
 wiki_resolve_email() {
   local who="$1"
+  wiki_as_validate "$who"
   if [[ "$who" == *@* ]]; then printf '%s' "$who"; return 0; fi
-  ssh_run "awk -F'|' -v q='$who' '\$1 ~ /^#/ {next} q ~ /@/ {if (\$3==q) {print \$3; exit} next} \$2==q {print \$3; exit} \$3==q {print \$3; exit} {n=split(\$3,a,\"@\"); if (a[1]==q) {print \$3; exit}}' '$WIKI_CREDS' 2>/dev/null"
+  ssh_run "awk -F'|' -v q=$(shq "$who") '\$1 ~ /^#/ {next} q ~ /@/ {if (\$3==q) {print \$3; exit} next} \$2==q {print \$3; exit} \$3==q {print \$3; exit} {n=split(\$3,a,\"@\"); if (a[1]==q) {print \$3; exit}}' $(shq "$WIKI_CREDS") 2>/dev/null"
 }
 
 wiki_login() {
   local who="$1" email pw code
   email="$(wiki_resolve_email "$who")"
   [ -n "$email" ] || die "Wiki-Konto '$who' nicht in $WIKI_CREDS gefunden"
-  pw="$(ssh_run "awk -F'|' -v e='$email' '\$3==e{print \$4; exit}' '$WIKI_CREDS' 2>/dev/null")"
+  pw="$(ssh_run "awk -F'|' -v e=$(shq "$email") '\$3==e{print \$4; exit}' $(shq "$WIKI_CREDS") 2>/dev/null")"
   [ -n "$pw" ] || die "Kein Passwort fuer '$email' in $WIKI_CREDS gefunden"
   WIKI_COOKIE="$(mktmp)"
   code="$(wiki_http /dev/null -X POST \
@@ -775,22 +799,33 @@ wiki_yaml_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 # wex_log <quiet> <text...> - Fortschritt auf stderr; mit --quiet unterdrueckt.
 wex_log() { local q="$1"; shift; [ "$q" -eq 1 ] || printf 'teamctl: %s\n' "$*" >&2; }
 
-# wiki_export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
+# wex_schema_file <basename> - entspricht der Dateiname dem Export-Schema
+# <space-slug>__<page-slug>[-<pid8>].md? Slugs stammen aus wiki_slugify
+# ([a-z0-9-]); <pid8> sind die ersten 8 Zeichen der Seiten-ID.
+wex_schema_file() {
+  printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9-]*__[a-z0-9][a-z0-9-]*(-[A-Za-z0-9]{8})?\.md$'
+}
+
+# wiki_export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
 # Exportiert alle (oder mit --space nur die eines Spaces) Docmost-Seiten als
 # Markdown: eine Datei je Seite "<space-slug>__<page-slug>.md" mit YAML-Kopfzeile
 # (title, space, spaceId, pageId). Idempotent ueber ein Manifest
-# (.wiki-sync-manifest.tsv); im Wiki geloeschte Seiten werden aus dem Export
-# entfernt (ausser mit --no-prune). Es werden keine Secrets ausgegeben; die
+# (.wiki-sync-manifest.tsv); im Wiki geloeschte Export-Dateien werden entfernt.
+# Pruning ist schema-begrenzt: per Default werden nur Dateien im Export-Schema
+# angefasst (fremde *.md im --out bleiben erhalten); aggressives Pruning ALLER
+# nicht im Manifest stehenden *.md nur mit explizitem --prune; --no-prune
+# deaktiviert das Pruning ganz (M1). Es werden keine Secrets ausgegeben; die
 # Zugangsdaten stammen aus der teamctl-Konfiguration (TEAMCTL_WIKI_*).
 # Default-Ziel: WIKI_EXPORT_DIR, sonst ~/.openclaw/wiki.
 # Exit: 0 = vollstaendig, 1 = Fehler (unvollstaendig).
 wiki_export() {
   local out="${WIKI_EXPORT_DIR:-$HOME/.openclaw/wiki}"
-  local only_space="" dry=0 prune=1 quiet=0
+  local only_space="" dry=0 prune=1 aggressive=0 quiet=0
   while [ $# -gt 0 ]; do case "$1" in
     --out)      [ $# -ge 2 ] || die "wiki export: --out braucht einen Wert"; out="$2"; shift 2 ;;
     --space)    [ $# -ge 2 ] || die "wiki export: --space braucht einen Wert"; only_space="$2"; shift 2 ;;
     --dry-run)  dry=1; shift ;;
+    --prune)    aggressive=1; shift ;;
     --no-prune) prune=0; shift ;;
     --quiet)    quiet=1; shift ;;
     *) die "wiki export: unbekannte Option '$1'" ;;
@@ -892,11 +927,15 @@ wiki_export() {
   fi
 
   # 3) Pruning: im Wiki geloeschte Seiten aus dem Export entfernen.
+  # Default: nur Dateien im Export-Schema (M1) - fremde *.md im --out bleiben
+  # unangetastet. Erst explizites --prune entfernt ALLE nicht im Manifest
+  # stehenden *.md (Altverhalten). --no-prune deaktiviert das Pruning ganz.
   if [ "$prune" -eq 1 ] && [ -d "$out" ]; then
     local base
     while IFS= read -r f; do
       base="$(basename "$f")"
       case "$base" in .*) continue ;; esac
+      if [ "$aggressive" -eq 0 ] && ! wex_schema_file "$base"; then continue; fi
       if [ -n "$only_space" ]; then
         case "$base" in "${exp_slug}__"*) ;; *) continue ;; esac
       fi

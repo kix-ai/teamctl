@@ -75,7 +75,7 @@ betroffenen Schluessel nennt - nie den Wert, Host oder die URL.
 | `TEAMCTL_RETRY_MAX` | `4` | Wiederholungen bei HTTP 429 |
 | `TEAMCTL_RETRY_BASE` | `2` | Basis-Sekunden fuer das Backoff |
 | `TEAMCTL_RETRY_CAP` | `30` | Obergrenze der Wartezeit je Versuch (Sekunden) |
-| `TEAMCTL_WIKI_CA` | (kein) | Pfad zum CA-/Leaf-Zertifikat (PEM) des Wiki-Hosts; gesetzt => Wiki-curl-Aufrufe nutzen `--cacert` und verifizieren das Zertifikat |
+| `TEAMCTL_WIKI_CA` | (kein) | Pfad zum CA-/Leaf-Zertifikat (PEM) des Wiki-Hosts; gesetzt => Wiki-curl-Aufrufe nutzen `--cacert` und verifizieren das Zertifikat. Ohne den Schluessel laufen Wiki-Aufrufe mit `-k` (TLS-Verifikation AUS - nur fuer die selbstsignierte Infrastruktur) |
 
 ## Beispiele
 
@@ -88,7 +88,7 @@ WIKI (Docmost)
     teamctl wiki create --space <spaceId> --title <T> --file <md> [--parent <pageId>]
     teamctl wiki update <pageId> --file <md> [--mode replace|append|prepend] [--parent <pageId>|--parent '']
     teamctl wiki upload <pageId> <bilddatei>
-    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
+    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
     (optional ueberall: --as <email|name>)
     (wiki update --parent <pageId> haengt die Seite um; --parent '' loest sie auf Root)
     (wiki create/update verifizieren Titel, --parent-parentPageId und den
@@ -175,18 +175,22 @@ indiziert; so ist das Wiki durchsuchbar, ohne jede Seite in den Kontext zu laden
 - Ziel: eine Markdown-Datei pro Seite, `<space-slug>__<page-slug>.md`, mit
   YAML-Kopfzeile (`title`, `space`, `spaceId`, `pageId`) und dem Seiteninhalt.
 - Idempotent: unveraenderte Seiten werden nicht angefasst; im Wiki geloeschte
-  Seiten werden per Manifest (`.wiki-sync-manifest.tsv`) aus dem Ziel entfernt
-  (ausser mit `--no-prune`).
+  Export-Dateien entfernt das Pruning per Manifest
+  (`.wiki-sync-manifest.tsv`). Per Default wird dabei nur das Export-Schema
+  `<space>__<page>[-<pid8>].md` angefasst - fremde `*.md` im `--out` bleiben
+  erhalten; aggressives Loeschen ALLER nicht im Manifest stehenden `*.md`
+  erfordert explizites `--prune`, `--no-prune` deaktiviert das Pruning ganz.
 - Exit 0 = vollstaendiger Export, 1 = Fehler (unvollstaendig).
 
-    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--no-prune] [--quiet]
+    teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
 
 | Option | Bedeutung |
 | --- | --- |
 | `--out DIR` | Zielverzeichnis (Default: `WIKI_EXPORT_DIR`, sonst `~/.openclaw/wiki`) |
 | `--space <spaceId>` | nur diesen Space exportieren (andere Spaces bleiben unberuehrt) |
 | `--dry-run` | nur zeigen, was sich aendern wuerde (keine Schreibzugriffe) |
-| `--no-prune` | im Wiki geloeschte Seiten im Ziel belassen |
+| `--prune` | aggressives Pruning: ALLE nicht im Manifest stehenden `*.md` entfernen (Opt-in) |
+| `--no-prune` | gar kein Pruning: im Wiki geloeschte Dateien im Ziel belassen |
 | `--quiet` | Fortschrittsausgabe unterdruecken (Fehler bleiben sichtbar) |
 
 | Variable | Default | Bedeutung |
@@ -335,11 +339,23 @@ teamctl doctor
   Schluesselnamen, nie den Befehl oder den Token.
 - `TEAMCTL_WIKI_CA` nennt nur den Pfad zu einer CA-/Leaf-Zertifikatsdatei
   (PEM) ausserhalb von Git. Ist der Schluessel gesetzt, verifizieren alle
-  Wiki-curl-Aufrufe das Serverzertifikat ueber `--cacert` (kein `-k`/Bypass).
-  Fehlt die Datei, ist sie leer oder nicht lesbar, bricht `teamctl` ab; die
-  Meldung nennt nur den Schluesselnamen, nie den Pfad oder Zertifikatsinhalt.
-- Ohne `TEAMCTL_WIKI_CA` nutzen Wiki-Aufrufe die System-CA. Fuer ein
-  selbstsigniertes Wiki muss der Schluessel gesetzt sein.
+  Wiki-curl-Aufrufe das Serverzertifikat ueber `--cacert`; `-k` wird in
+  diesem Fall NICHT gesetzt (H2: frueher entwertete ein globales `-k` das
+  `--cacert`). Fehlt die Datei, ist sie leer oder nicht lesbar, bricht
+  `teamctl` ab; die Meldung nennt nur den Schluesselnamen, nie den Pfad oder
+  Zertifikatsinhalt.
+- Ohne `TEAMCTL_WIKI_CA` laufen Wiki-Aufrufe mit `-k` (TLS-Verifikation AUS).
+  Das ist nur fuer die selbstsignierte Infrastruktur noetig; fuer ein
+  verifiziertes bzw. selbstsigniertes Wiki mit bekannter CA den Schluessel
+  setzen. `-k` steht bewusst nur in diesem Fall (WIKI_CURL_OPTS), nie global.
+- `--as`/`TEAMCTL_WIKI_AS` wird per Whitelist validiert (nur Buchstaben,
+  Ziffern, `. _ @ + -` und Leerzeichen); Shell-Metazeichen werden abgelehnt.
+  In ssh-awk-Aufrufen wird der Wert zusaetzlich remote single-quoted
+  (`shq`), kann also nie aus dem Quoting ausbrechen (H1: Command-Injection).
+- `teamctl wiki export` entfernt per Default nur Dateien, die dem Export-Schema
+  `<space>__<page>[-<pid8>].md` entsprechen; fremde `*.md` im `--out` bleiben
+  erhalten. Aggressives Loeschen ALLER nicht im Manifest stehenden `*.md` nur
+  mit explizitem `--prune` (M1).
 
 ## Selbsttest (Regressions-Guard)
 

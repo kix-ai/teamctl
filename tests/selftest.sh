@@ -1022,6 +1022,214 @@ else
   pass "wiki update (leerer Inhalt, Verifikations-Haertung): leerer Inhalt -> Abbruch (Exit $hrc)"
 fi
 
+# --- 13) H1: Command-Injection ueber --as (Issue #23) -----------------------
+# --as/WIKI_AS wird per Whitelist validiert; in ssh-awk-Aufrufen wird der Wert
+# ueber shq() remote sicher single-quoted. Beide Schutzschichten werden geprueft.
+ASBIN="$WORK/asbin"; mkdir -p "$ASBIN"
+cat > "$ASBIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$AS_LOG"
+exit 0
+STUB
+chmod +x "$ASBIN/ssh"
+cat > "$ASBIN/curl" <<'STUB'
+#!/usr/bin/env bash
+out=/dev/null
+while [ $# -gt 0 ]; do case "$1" in
+  -o) out="$2"; shift 2 ;;
+  -D|-b|-c|-H|-X|--max-time|-w|--data-binary|--cacert) shift 2 ;;
+  -*) shift ;;
+  *) shift ;;
+esac; done
+printf '{}' > "$out"
+printf '200'
+STUB
+chmod +x "$ASBIN/curl"
+AS_LOG="$WORK/as.log"; : > "$AS_LOG"
+AK="$WORK/id_as_dummy"; : > "$AK"
+as_run() { env PATH="$ASBIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' TEAMCTL_WIKI_AS='selftest@selftest.invalid' TEAMCTL_SSH_KEY="$AK" AS_LOG="$AS_LOG" bash "$TEAMCTL" "$@"; }
+
+# 13a) Metazeichen-Nutzenlast -> --as abgelehnt (kein ssh, kein Marker).
+inj="x'; touch $MK/h1pwn; '"
+h1out="$(as_run wiki me --as "$inj" 2>&1)"; h1rc=$?
+if [ "$h1rc" -eq 0 ]; then
+  fail "H1 (Issue #23): --as-Injection nicht abgelehnt (Exit 0)"
+elif ! printf '%s' "$h1out" | grep -q -- '--as'; then
+  fail "H1 (Issue #23): keine klare --as-Meldung"
+  printf '%s\n' "$h1out" | sed 's/^/      /' >&2
+elif [ -e "$MK/h1pwn" ]; then
+  fail "H1 (Issue #23): Marker angelegt - Wert wurde ausgewertet"
+elif [ -s "$AS_LOG" ]; then
+  fail "H1 (Issue #23): ssh trotz ungueltigem --as aufgerufen"
+else
+  pass "H1 (Issue #23): --as-Injection abgelehnt, kein ssh, kein Marker (Exit $h1rc)"
+fi
+
+# 13b) gueltiger Name erreicht ssh und wird single-quoted als Daten uebergeben.
+: > "$AS_LOG"
+n1out="$(as_run wiki me --as "alice" 2>&1)"; n1rc=$?
+if ! grep -qF -- "-v q='alice'" "$AS_LOG"; then
+  fail "H1 (Issue #23): gueltiger --as nicht als Daten (q='alice') an ssh uebergeben"
+  sed 's/^/      /' "$AS_LOG" >&2
+else
+  pass "H1 (Issue #23): gueltiger --as als single-quoted Daten an ssh uebergeben"
+fi
+
+# 13c) Guard: anfaellige Rohform entfernt, shq + wiki_as_validate vorhanden.
+if grep -qF -- "-v q='\$who'" "$TEAMCTL"; then
+  fail "H1 (Issue #23): anfaelliges Muster -v q='\$who' weiterhin vorhanden"
+elif ! grep -q '^shq()' "$TEAMCTL"; then
+  fail "H1 (Issue #23): shq-Helfer fehlt"
+elif ! grep -q 'wiki_as_validate' "$TEAMCTL"; then
+  fail "H1 (Issue #23): wiki_as_validate fehlt"
+else
+  pass "H1 (Issue #23): Rohform entfernt, shq + wiki_as_validate vorhanden"
+fi
+
+# --- 14) H2: TLS-Verifikation (Issue #24) -----------------------------------
+# '-k' darf NUR ohne TEAMCTL_WIKI_CA gelten; mit CA muss --cacert die
+# Verifikation aktiv halten (frueher entwertete -k das --cacert). Geprueft
+# ueber die curl-Argumente (curl-Stub protokolliert sie).
+CSBIN="$WORK/csbin"; mkdir -p "$CSBIN"
+cat > "$CSBIN/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$CS_LOG"
+out=/dev/null
+while [ $# -gt 0 ]; do case "$1" in
+  -o) out="$2"; shift 2 ;;
+  -X|-D|-H|-b|-c|--max-time|--data-binary|-w|--cacert) shift 2 ;;
+  -*) shift ;;
+  *) shift ;;
+esac; done
+printf '%s' '{"data":{"user":{"name":"selftest"}}}' > "$out"
+printf '200'
+STUB
+chmod +x "$CSBIN/curl"
+cat > "$CSBIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+printf 'dummy\n'
+exit 0
+STUB
+chmod +x "$CSBIN/ssh"
+CS_LOG="$WORK/cs.log"; : > "$CS_LOG"
+CK="$WORK/id_cs_dummy"; : > "$CK"
+cs_run() { local _ca="$1"; shift; env PATH="$CSBIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_SSH_KEY="$CK" CS_LOG="$CS_LOG" TEAMCTL_WIKI_CA="$_ca" bash "$TEAMCTL" "$@"; }
+
+# 14a) ohne CA -> -k (Insecure-Fallback), kein --cacert.
+: > "$CS_LOG"
+cs_run '' wiki me --as 'selftest@selftest.invalid' >/dev/null 2>&1 || true
+if grep -qE '(^| )-k( |$)' "$CS_LOG" && ! grep -qF -- '--cacert' "$CS_LOG"; then
+  pass "H2 (Issue #24): ohne CA -> '-k', kein --cacert"
+else
+  fail "H2 (Issue #24): ohne CA fehlt '-k' oder --cacert gesetzt"
+  sed 's/^/      /' "$CS_LOG" >&2
+fi
+
+# 14b) mit CA -> --cacert (Verifikation aktiv), kein -k.
+CAF="$WORK/selftest-ca.pem"
+if command -v openssl >/dev/null 2>&1; then
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/selftest-ca.key" -out "$CAF" -days 2 -subj '/CN=selftest.invalid' >/dev/null 2>&1
+fi
+if [ -s "$CAF" ]; then
+  : > "$CS_LOG"
+  cs_run "$CAF" wiki me --as 'selftest@selftest.invalid' >/dev/null 2>&1 || true
+  if grep -qF -- '--cacert' "$CS_LOG" && ! grep -qE '(^| )-k( |$)' "$CS_LOG"; then
+    pass "H2 (Issue #24): mit CA -> '--cacert', kein '-k'"
+  else
+    fail "H2 (Issue #24): mit CA fehlt --cacert oder '-k' aktiv"
+    sed 's/^/      /' "$CS_LOG" >&2
+  fi
+else
+  pass "H2 (Issue #24): mit-CA-Test uebersprungen (openssl fehlt)"
+fi
+
+# 14c) Guard: CURL_OPTS enthaelt kein -k mehr.
+if grep -q 'CURL_OPTS=(-sk' "$TEAMCTL"; then
+  fail "H2 (Issue #24): CURL_OPTS enthaelt weiter '-k'"
+else
+  pass "H2 (Issue #24): CURL_OPTS ohne '-k'"
+fi
+
+# --- 15) M1: wiki export Pruning (Issue #25) --------------------------------
+# Pruning darf per Default nur Dateien im Export-Schema entfernen; fremde *.md
+# im --out bleiben erhalten. Aggressiv (alle *.md) nur mit --prune.
+EXBIN="$WORK/exbin"; mkdir -p "$EXBIN"
+cat > "$EXBIN/curl" <<'STUB'
+#!/usr/bin/env bash
+out=/dev/null; data=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -X) shift 2 ;;
+    --data-binary) data="$2"; shift 2 ;;
+    -D|-H|--max-time|-w|-b|-c|--cacert) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+ep="${url##*/api/}"
+case "$ep" in
+  auth/login) body='{"data":{"user":{"name":"selftest"}}}' ;;
+  spaces/) body='{"data":{"items":[{"id":"sp-1","slug":"general","name":"General"}]}}' ;;
+  pages/sidebar-pages) body='{"data":{"items":[{"id":"deadbeef-cafe-4e5d-9a1b-000000000001","title":"Page One","hasChildren":false}]}}' ;;
+  pages/info) body='{"data":{"content":"# Hallo Welt","title":"Page One"}}' ;;
+  *) body='{"message":"stub: unhandled"}' ;;
+esac
+printf '%s' "$body" > "$out"
+printf '200'
+STUB
+chmod +x "$EXBIN/curl"
+cat > "$EXBIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+printf 'dummy\n'
+exit 0
+STUB
+chmod +x "$EXBIN/ssh"
+EK="$WORK/id_ex_dummy"; : > "$EK"
+EXOUT="$WORK/exp"
+ex_build() {
+  rm -rf "$EXOUT"; mkdir -p "$EXOUT"
+  printf 'fremd\n' > "$EXOUT/notes.md"
+  printf 'fremd\n' > "$EXOUT/README.md"
+  printf 'veraltet\n' > "$EXOUT/general__old-page.md"
+  printf 'veraltet\n' > "$EXOUT/general__gone-1234abcd.md"
+}
+ex_run() { env PATH="$EXBIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' TEAMCTL_SSH_KEY="$EK" TEAMCTL_WIKI_EXPORT_SLEEP=0 TEAMCTL_WIKI_AS='selftest@selftest.invalid' bash "$TEAMCTL" wiki export --out "$EXOUT" "$@"; }
+
+# 15a) Default: Schema-Dateien ohne Manifest entfernt, fremde *.md bleiben.
+ex_build
+xout="$(ex_run 2>&1)"; xrc=$?
+if [ "$xrc" -ne 0 ]; then
+  fail "M1 (Issue #25): Export Exit != 0 (war $xrc)"
+  printf '%s\n' "$xout" | sed 's/^/      /' >&2
+elif [ -e "$EXOUT/general__old-page.md" ] || [ -e "$EXOUT/general__gone-1234abcd.md" ]; then
+  fail "M1 (Issue #25): veraltete Schema-Dateien nicht entfernt"
+elif [ ! -f "$EXOUT/notes.md" ] || [ ! -f "$EXOUT/README.md" ]; then
+  fail "M1 (Issue #25): fremde *.md im --out geloescht (Default-Pruning zu aggressiv)"
+elif [ ! -f "$EXOUT/general__page-one.md" ]; then
+  fail "M1 (Issue #25): Export-Datei der Seite fehlt"
+else
+  pass "M1 (Issue #25): Default entfernt nur Schema-Dateien, fremde *.md bleiben"
+fi
+
+# 15b) --no-prune: gar kein Loeschen.
+ex_build
+ex_run --no-prune >/dev/null 2>&1 || true
+if [ -f "$EXOUT/general__old-page.md" ] && [ -f "$EXOUT/notes.md" ]; then
+  pass "M1 (Issue #25): --no-prune laesst alles unveraendert"
+else
+  fail "M1 (Issue #25): --no-prune hat Dateien entfernt"
+fi
+
+# 15c) --prune: aggressiv, entfernt auch fremde *.md.
+ex_build
+ex_run --prune >/dev/null 2>&1 || true
+if [ -f "$EXOUT/notes.md" ] || [ -f "$EXOUT/README.md" ]; then
+  fail "M1 (Issue #25): --prune entfernte fremde *.md nicht (Opt-in aggressiv)"
+else
+  pass "M1 (Issue #25): --prune entfernt alle nicht im Manifest stehenden *.md"
+fi
+
 # --- Ergebnis ---------------------------------------------------------------
 if [ "$FAILS" -gt 0 ]; then
   printf 'FAIL: %d Test(s) fehlgeschlagen\n' "$FAILS" >&2
