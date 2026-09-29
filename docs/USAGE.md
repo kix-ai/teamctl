@@ -23,9 +23,15 @@ BLOG (statische Seite auf dem Host)
     teamctl blog list
     teamctl blog publish --file <html> --slug <slug> [--title <T>] [--link|--no-link]
     teamctl blog link --title <T> --slug <slug>
+    teamctl blog unpublish --slug <slug> [--yes]
+    teamctl blog unlink --slug <slug>
     (publish haengt den Post standardmaessig in index.html ein und verifiziert
      den Eintrag per Read-back; --no-link uebersprungen = Warnhinweis;
      --title setzt den Index-Titel, sonst wird <title> aus der Datei gelesen)
+    (unpublish entfernt posts/<slug>.html remote - nur mit Bestaetigung
+     (interaktiv Rueckfrage, nicht-interaktiv --yes) und nur unter posts/,
+     mit Read-back; unlink haengt den <li>-Eintrag aus index.html aus -
+     idempotent, mit Read-back ueber die Link-Anzahl)
 
 GIT (GitHub, Token aus der Konfiguration)
 

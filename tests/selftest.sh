@@ -1615,7 +1615,9 @@ ENV
 chmod 600 "$BLOGENV"
 
 blog_run() {
-  PATH="$BLOG_BIN:$PATH" TEAMCTL_ENV_FILE="$BLOGENV" bash "$TEAMCTL" blog "$@" 2>&1
+  # stdin auf /dev/null: unpublish darf nie in einen interaktiven Prompt
+  # laufen (die Bestaetigung ist per --yes zu geben).
+  PATH="$BLOG_BIN:$PATH" TEAMCTL_ENV_FILE="$BLOGENV" bash "$TEAMCTL" blog "$@" </dev/null 2>&1
 }
 
 POST1="$WORK/post1.html"
@@ -1686,6 +1688,90 @@ if printf '%s' "$out18f" | grep -q 'SKIP'; then
   pass "18f: blog link ist idempotent (SKIP)"
 else
   fail "18f: blog link nicht idempotent ($out18f)"
+fi
+
+# --- 19) blog unpublish + blog unlink (Gegenseite zu publish/link) ----------
+# Gleiche hermetische Umgebung wie Test 18 (SSH-/SCP-Stubs, lokales Blogroot).
+# blog unpublish loescht NUR nach expliziter Bestaetigung (nicht-interaktiv
+# per --yes) und nur eine Datei unterhalb von posts/; blog unlink entfernt
+# den <li>-Eintrag idempotent mit Read-back.
+
+# 19a) Ohne --yes (nicht-interaktiv) keine Loeschung + klarer Hinweis.
+out19a="$(blog_run unpublish --slug soc-blog)"
+rc19a=$?
+if [ "$rc19a" -ne 0 ] \
+   && printf '%s' "$out19a" | grep -q -- '--yes' \
+   && [ -f "$BLOGROOT/posts/soc-blog.html" ]; then
+  pass "19a: unpublish ohne --yes loescht nicht (Bestaetigung erzwungen)"
+else
+  fail "19a: unpublish ohne --yes falsch (rc=$rc19a, out=$out19a)"
+fi
+
+# 19b) Slug-Whitelist: Metazeichen/Pfadanteile werden abgelehnt.
+out19b="$(blog_run unpublish --slug '../index' --yes)"
+rc19b=$?
+out19b2="$(blog_run unpublish --slug 'a/b' --yes)"
+rc19b2=$?
+if [ "$rc19b" -ne 0 ] && [ "$rc19b2" -ne 0 ] \
+   && [ -f "$BLOGROOT/index.html" ] && [ -f "$BLOGROOT/posts/soc-blog.html" ]; then
+  pass "19b: unpublish lehnt ungueltige Slugs ab (Whitelist)"
+else
+  fail "19b: Slug-Whitelist greift nicht (rc=$rc19b/$rc19b2)"
+fi
+
+# 19c) Nicht vorhandene Datei = Fehler (kein stilles OK).
+out19c="$(blog_run unpublish --slug does-not-exist --yes)"
+rc19c=$?
+if [ "$rc19c" -ne 0 ]; then
+  pass "19c: unpublish fehlender Datei ist ein Fehler"
+else
+  fail "19c: unpublish fehlender Datei meldet Erfolg ($out19c)"
+fi
+
+# 19d) Mit --yes: Datei weg + Read-back, Hinweis auf 'blog unlink'.
+out19d="$(blog_run unpublish --slug soc-blog --yes)"
+rc19d=$?
+if [ "$rc19d" -eq 0 ] \
+   && [ ! -e "$BLOGROOT/posts/soc-blog.html" ] \
+   && printf '%s' "$out19d" | grep -q 'blog unlink'; then
+  pass "19d: unpublish --yes entfernt posts/<slug>.html (Read-back)"
+else
+  fail "19d: unpublish --yes falsch (rc=$rc19d, out=$out19d)"
+fi
+
+# 19e) unlink entfernt genau den <li>-Eintrag, andere Eintraege bleiben.
+links_before="$(grep -c 'href="/posts/' "$BLOGROOT/index.html" || true)"
+out19e="$(blog_run unlink --slug soc-blog)"
+rc19e=$?
+links_after="$(grep -c 'href="/posts/' "$BLOGROOT/index.html" || true)"
+if [ "$rc19e" -eq 0 ] \
+   && [ "$links_after" -eq "$((links_before - 1))" ] \
+   && ! grep -qF 'href="/posts/soc-blog.html"' "$BLOGROOT/index.html" \
+   && grep -qF 'href="/posts/existing.html"' "$BLOGROOT/index.html" \
+   && grep -qF 'href="/posts/titled.html"' "$BLOGROOT/index.html"; then
+  pass "19e: unlink entfernt genau den Eintrag (links $links_before -> $links_after)"
+else
+  fail "19e: unlink falsch (rc=$rc19e, links $links_before -> $links_after)"
+fi
+
+# 19f) unlink ist idempotent (SKIP, keine Aenderung).
+out19f="$(blog_run unlink --slug soc-blog)"
+rc19f=$?
+links_after2="$(grep -c 'href="/posts/' "$BLOGROOT/index.html" || true)"
+if [ "$rc19f" -eq 0 ] && printf '%s' "$out19f" | grep -q 'SKIP' \
+   && [ "$links_after2" -eq "$links_after" ]; then
+  pass "19f: unlink ist idempotent (SKIP)"
+else
+  fail "19f: unlink nicht idempotent (rc=$rc19f, out=$out19f)"
+fi
+
+# 19g) unlink --slug fehlt = Fehler.
+out19g="$(blog_run unlink)"
+rc19g=$?
+if [ "$rc19g" -ne 0 ]; then
+  pass "19g: unlink ohne --slug ist ein Fehler"
+else
+  fail "19g: unlink ohne --slug meldet Erfolg"
 fi
 
 # --- Ergebnis ---------------------------------------------------------------

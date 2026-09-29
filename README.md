@@ -105,9 +105,15 @@ BLOG (statische Seite auf dem Host)
     teamctl blog list
     teamctl blog publish --file <html> --slug <slug> [--title <T>] [--link|--no-link]
     teamctl blog link --title <T> --slug <slug>
+    teamctl blog unpublish --slug <slug> [--yes]
+    teamctl blog unlink --slug <slug>
     (publish haengt den Post standardmaessig in index.html ein und verifiziert
      den Eintrag per Read-back; --no-link uebersprungen = Warnhinweis;
      --title setzt den Index-Titel, sonst wird <title> aus der Datei gelesen)
+    (unpublish entfernt posts/<slug>.html remote - nur mit Bestaetigung
+     (interaktiv Rueckfrage, nicht-interaktiv --yes) und nur unter posts/;
+     unlink haengt den <li>-Eintrag aus index.html aus - idempotent, mit
+     Read-back ueber die Link-Anzahl)
 
 GIT (GitHub, Konto per Token)
 
@@ -400,6 +406,13 @@ teamctl doctor
   `--no-link` ueberspringt das mit deutlichem Warnhinweis, `--link` erzwingt es
   explizit. Ohne Titel (weder `--title` noch `<title>` in der Datei) bricht
   `blog publish` nach dem Upload mit klarer Meldung + `blog link`-Hinweis ab.
+- `blog unpublish` loescht `posts/<slug>.html` nur nach Bestaetigung
+  (nicht-interaktiv `--yes`) und nur mit gueltigem Slug (Whitelist, kein `.`/`..`);
+  der Zielpfad wird zwingend als `<BLOG_DIR>/posts/<slug>.html` gebildet und
+  gegen die `posts/`-Whitelist geprueft, danach Read-back (Datei muss weg sein).
+  `blog unlink` entfernt den `<li>`-Eintrag idempotent `index.html` und
+  verifiziert per Read-back, dass die Link-Anzahl genau sinkt und der Slug weg
+  ist.
 - `wiki export` legt Manifest- und Datei-Temp im Zielverzeichnis an, damit das
   abschliessende `mv` innerhalb desselben Dateisystems atomar bleibt (N4);
   Manifest-Felder werden von echten Tabs/CR/LF befreit (`wex_tsv`), damit die
@@ -415,7 +428,10 @@ Body-only-Erstellerkennung, atomarer Wiki-Export). Zusaetzlich deckt er die
 Blog-Auto-Link-Logik von `blog publish` hermetisch ab (SSH-/SCP-Stubs, kein
 Netz): Default laedt hoch und haengt ein, `--no-link` ueberspringt
 (Warnhinweis), `--title` schlaegt den Datei-`<title>`; fehlender Titel =
-Read-back-Fehler mit `blog link`-Hinweis, `blog link` bleibt idempotent:
+Read-back-Fehler mit `blog link`-Hinweis, `blog link` bleibt idempotent.
+Ebenso abgedeckt: `blog unpublish` (ohne `--yes` keine Loeschung,
+Slug-Whitelist, fehlende Datei = Fehler, `--yes` entfernt + Read-back) und
+`blog unlink` (genau ein Eintrag weg, andere bleiben, idempotent per SKIP):
 
 ```bash
 bash tests/selftest.sh

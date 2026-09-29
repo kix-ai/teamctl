@@ -303,9 +303,14 @@ BLOG (statische Seite auf dem Infra-Host)
   teamctl blog list
   teamctl blog publish --file <html> --slug <slug> [--title <T>] [--link|--no-link]
   teamctl blog link --title <T> --slug <slug>
+  teamctl blog unpublish --slug <slug> [--yes]
+  teamctl blog unlink --slug <slug>
   (publish haengt den Post standardmaessig in index.html ein und prueft das
    per Read-back; --no-link ueberspringt die Einhaengung mit Warnhinweis;
    --title setzt den Index-Titel, sonst wird <title> aus der Datei genommen)
+  (unpublish entfernt posts/<slug>.html remote - nur mit Bestaetigung:
+   interaktiv per Rueckfrage, nicht-interaktiv per --yes; unlink haengt den
+   <li>-Eintrag aus index.html aus, idempotent, mit Read-back)
 
 GIT (GitHub, Konto per Token)
   teamctl git info <repo>
@@ -1183,14 +1188,110 @@ PY
   printf 'OK\t%s\tlinks=%s\n' "$slug" "$after"
 }
 
+# blog_unpublish --slug <slug> [--yes] - entfernt posts/<slug>.html remote.
+# Gegenseite zu 'blog publish'. Schutz:
+#   * Slug-Whitelist (BLOG_SLUG_RE) + explizite Ablehnung von "." und ".."
+#   * der Zielpfad wird ZWINGEND als <BLOG_DIR>/posts/<slug>.html gebildet
+#     (kein Benutzerpfad) und gegen die posts/-Whitelist geprueft
+#   * Bestaetigung: interaktiv per Rueckfrage, nicht-interaktiv per --yes
+# Read-back: nach dem Entfernen darf die Datei nicht mehr existieren.
+blog_unpublish() {
+  local slug="" yes=0 remote_path _ans=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --slug) [ $# -ge 2 ] || die "blog unpublish: --slug braucht einen Wert"; slug="$2"; shift 2 ;;
+    --yes|-y) yes=1; shift ;;
+    *) die "blog unpublish: unbekannte Option '$1'" ;;
+  esac; done
+  [ -n "$slug" ] || die "blog unpublish: --slug fehlt"
+  [[ "$slug" =~ $BLOG_SLUG_RE ]] || die "blog unpublish: ungueltiger Slug '$slug'"
+  case "$slug" in .|..) die "blog unpublish: ungueltiger Slug '$slug'" ;; esac
+  remote_path="$BLOG_DIR/posts/$slug.html"
+  case "$remote_path" in
+    "$BLOG_DIR"/posts/*.html) ;;
+    *) die "blog unpublish: Pfad ausserhalb von posts/ abgelehnt" ;;
+  esac
+  if [ "$yes" -eq 0 ]; then
+    if [ -t 0 ]; then
+      printf 'teamctl: posts/%s.html remote entfernen? [j/N] ' "$slug" >&2
+      IFS= read -r _ans || _ans=""
+      case "$_ans" in j|J|y|Y|ja|yes) ;; *) die "blog unpublish: abgebrochen" ;; esac
+    else
+      die "blog unpublish: Bestaetigung fehlt - nicht-interaktiv mit --yes bestaetigen (loescht posts/$slug.html)"
+    fi
+  fi
+  ssh_run "test -f '$remote_path'" || die "blog unpublish: posts/$slug.html existiert nicht"
+  ssh_run "rm -f -- '$remote_path'" || die "blog unpublish: Entfernen fehlgeschlagen"
+  if ssh_run "test -e '$remote_path'"; then
+    die "blog unpublish: Read-back fehlgeschlagen - posts/$slug.html ist noch vorhanden"
+  fi
+  printf 'OK\t/posts/%s.html\tentfernt\n' "$slug"
+  note "blog unpublish: Datei entfernt. Ein noch vorhandener Index-Eintrag bleibt bestehen - aushaengen mit: teamctl blog unlink --slug $slug"
+}
+
+# blog_unlink --slug <slug> - entfernt den <li>-Eintrag mit
+# href="/posts/<slug>.html" aus index.html (idempotent). Read-back: die
+# Link-Anzahl sinkt um genau die entfernten Zeilen und der Slug ist danach
+# nicht mehr enthalten; fehlt der Eintrag, ist das kein Fehler (SKIP).
+blog_unlink() {
+  local slug="" tmp before=0 after=0 removed="" remote_tmp
+  while [ $# -gt 0 ]; do case "$1" in
+    --slug) [ $# -ge 2 ] || die "blog unlink: --slug braucht einen Wert"; slug="$2"; shift 2 ;;
+    *) die "blog unlink: unbekannte Option '$1'" ;;
+  esac; done
+  [ -n "$slug" ] || die "blog unlink: --slug fehlt"
+  [[ "$slug" =~ $BLOG_SLUG_RE ]] || die "blog unlink: ungueltiger Slug '$slug'"
+  case "$slug" in .|..) die "blog unlink: ungueltiger Slug '$slug'" ;; esac
+  tmp="$(mktmp)"
+  scp_from "$BLOG_DIR/index.html" "$tmp" || die "blog unlink: index.html nicht lesbar"
+  if ! grep -qF "href=\"/posts/$slug.html\"" "$tmp"; then
+    note "Link fuer '$slug' fehlt - keine Aenderung"
+    printf 'SKIP\t%s\n' "$slug"
+    return 0
+  fi
+  before="$(grep -c 'href="/posts/' "$tmp" || true)"
+  # Ganze Zeile des Eintrags entfernen (blog link schreibt einen <li> pro Zeile);
+  # das ist robust gegen zusaetzliche Attribute und laesst den Rest unberuehrt.
+  removed="$(python3 - "$tmp" "$slug" <<'PY' || die "blog unlink: index.html Bearbeitung fehlgeschlagen"
+import sys, io
+path, slug = sys.argv[1], sys.argv[2]
+doc = io.open(path, encoding='utf-8', errors='replace').read()
+needle = 'href="/posts/%s.html"' % slug
+kept, n = [], 0
+for line in doc.splitlines(True):
+    if needle in line:
+        n += 1
+        continue
+    kept.append(line)
+if n < 1:
+    sys.stderr.write('kein Eintrag fuer den Slug gefunden\n'); sys.exit(1)
+io.open(path, 'w', encoding='utf-8').write(''.join(kept))
+sys.stdout.write(str(n))
+PY
+)" || die "blog unlink: index.html Bearbeitung fehlgeschlagen"
+  case "$removed" in ''|*[!0-9]*) die "blog unlink: unerwartete Zeilenanzahl '$removed'" ;; esac
+  remote_tmp="$(remote_mktmp teamctl_index)"
+  [ -n "$remote_tmp" ] || die "blog unlink: keine remote Tempdatei (mktemp) erhalten"
+  scp_to "$tmp" "$remote_tmp" || { remote_rm "$remote_tmp"; die "blog unlink: scp fehlgeschlagen"; }
+  ssh_run "install -m 644 '$remote_tmp' '$BLOG_DIR/index.html' && rm -f '$remote_tmp'" || die "blog unlink: Deployment fehlgeschlagen"
+  after="$(ssh_run "grep -c 'href=\"/posts/' '$BLOG_DIR/index.html'" || true)"
+  case "$after" in ''|*[!0-9]*) die "blog unlink: Verifikation fehlgeschlagen (keine Link-Anzahl)" ;; esac
+  [ "$after" -eq "$((before - removed))" ] || die "blog unlink: Verifikation fehlgeschlagen (vorher=$before nachher=$after entfernt=$removed)"
+  if ssh_run "grep -q 'href=\"/posts/$slug.html\"' '$BLOG_DIR/index.html'"; then
+    die "blog unlink: Slug weiterhin in index.html gefunden"
+  fi
+  printf 'OK\t%s\tlinks=%s\n' "$slug" "$after"
+}
+
 blog_cmd() {
   local sub; sub="${1:-}"; shift || true
   case "$sub" in
     list) blog_list ;;
     publish) blog_publish "$@" ;;
     link) blog_link "$@" ;;
+    unpublish) blog_unpublish "$@" ;;
+    unlink) blog_unlink "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) die "blog: unbekannter Unterbefehl (list|publish|link)" ;;
+    *) die "blog: unbekannter Unterbefehl (list|publish|link|unpublish|unlink)" ;;
   esac
 }
 
