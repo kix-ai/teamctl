@@ -129,6 +129,10 @@ Meldung + Exit != 0.
 - Jeder Schreibbefehl prueft das Ergebnis per Read-back und bricht bei
   Abweichung ab (Exit-Code ungleich 0).
 - Keine Secrets in Ausgaben; Token und Passwoerter werden nur zur Laufzeit gelesen.
+- Issues: Titel als normaler Kurztitel **ohne Praefix**; die Agent-Kennung steht
+  **nur im Body** (`Ersteller: <agent-id>` + `Datum: <YYYY-MM-DD>`). `git issue`
+  warnt (Exit 0) bei fehlender Body-Kennung; `--require-author` bricht ab,
+  `--author <agent-id>` setzt die Kennung im Body.
 - `git read`/`git cat` liefern Dateiinhalte ueber die GitHub-Contents-API.
 - `git upload` erhaelt das Executable-Bit: ausfuehrbare lokale Dateien (mode +x)
   gehen ueber die Git-Data-API (mode 100755, blob -> tree -> commit -> ref),
@@ -142,6 +146,10 @@ Meldung + Exit != 0.
 Alle Werte kommen aus `teamctl.env` (chmod 600, nicht in Git); Vorlage ist
 `.env.example`. Echte Umgebungsvariablen haben Vorrang, der Pfad ist per
 `TEAMCTL_ENV_FILE` aenderbar.
+
+Die Datei wird nur geladen, wenn sie sicher ist (regulaere Datei, kein Symlink,
+Eigentuemer = aktueller Nutzer/root, kein Gruppen-/Welt-Schreibrecht) - sonst
+bricht `teamctl` ab, ohne sie auszufuehren.
 
 Pflichtwerte: TEAMCTL_INFRA_HOST, TEAMCTL_WIKI_URL, TEAMCTL_WIKI_EMAIL,
 TEAMCTL_BLOG_ROOT, TEAMCTL_GIT_OWNER, TEAMCTL_GIT_API.

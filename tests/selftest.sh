@@ -63,6 +63,9 @@ TEAMCTL_BLOG_ROOT=/tmp/teamctl-selftest-blog
 TEAMCTL_GIT_OWNER=selftest-owner
 TEAMCTL_GIT_API=https://selftest.invalid/api
 ENV
+# N5: der Konfigurations-Loader verlangt eine geschuetzte Datei. Unter umask
+# 002 entstuende hier 0664; fuer die Tests daher explizit 0600 setzen.
+chmod 600 "$ENVF"
 
 BIN="$WORK/bin"
 mkdir -p "$BIN"
@@ -1367,6 +1370,188 @@ elif ! printf '%s' "$icout7" | grep -q 'HTTP 500'; then
   printf '%s\n' "$icout7" | sed 's/^/      /' >&2
 else
   pass "git issue-comment (Issue #26, 16g): POST-Fehler -> Abbruch mit HTTP 500"
+fi
+
+# --- 17) Security-Haertung N1/N2/N3/N5/N6 ---------------------------------
+# N5: teamctl.env wird nur geladen, wenn sie sicher ist (kein Symlink,
+# Eigentuemer = aktueller Nutzer, nicht gruppen-/welt-schreibbar).
+N5DIR="$WORK/n5"; mkdir -p "$N5DIR"
+N5BAD="$N5DIR/unsafe.env"
+cp "$ENVF" "$N5BAD"; chmod 666 "$N5BAD"
+n5out="$(TEAMCTL_ENV_FILE="$N5BAD" bash "$TEAMCTL" git repos 2>&1)"; n5rc=$?
+if [ "$n5rc" -eq 0 ]; then
+  fail "N5: gruppen-/welt-schreibbare Config wurde geladen (Exit 0)"
+elif ! printf '%s' "$n5out" | grep -q 'unsicher'; then
+  fail "N5: gruppen-/welt-schreibbare Config ohne Unsicher-Meldung abgelehnt"
+  printf '%s\n' "$n5out" | sed 's/^/      /' >&2
+else
+  pass "N5 (a): gruppen-/welt-schreibbare Config abgelehnt (Exit $n5rc)"
+fi
+
+N5LINK="$N5DIR/link.env"; ln -s "$ENVF" "$N5LINK"
+n5out2="$(TEAMCTL_ENV_FILE="$N5LINK" bash "$TEAMCTL" git repos 2>&1)"; n5rc2=$?
+if [ "$n5rc2" -eq 0 ] || ! printf '%s' "$n5out2" | grep -q 'unsicher'; then
+  fail "N5: Symlink als Config nicht abgelehnt (rc=$n5rc2)"
+else
+  pass "N5 (b): Symlink als Config abgelehnt (Exit $n5rc2)"
+fi
+
+n5out3="$(PATH="$BIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_GITHUB_TOKEN_CMD='printf selftest-token' bash "$TEAMCTL" git repos 2>&1)"; n5rc3=$?
+if printf '%s' "$n5out3" | grep -q 'unsicher'; then
+  fail "N5 (c): sichere Config (0600) faelschlich abgelehnt"
+  printf '%s\n' "$n5out3" | sed 's/^/      /' >&2
+else
+  pass "N5 (c): sichere Config (0600, regulaer) akzeptiert"
+fi
+
+# N2: jedes Pfadsegment pruefen (Segment-Traversal, leere Segmente, absolut).
+N2F="$WORK/git_path_ok.sh"
+awk '/^git_path_ok\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$TEAMCTL" > "$N2F"
+if [ ! -s "$N2F" ]; then
+  fail "N2: git_path_ok nicht extrahierbar"
+else
+  (
+    . "$N2F"
+    git_path_ok "src/main.sh" || exit 10
+    git_path_ok "a/b.txt"    || exit 11
+    git_path_ok "a/../b"     && exit 12
+    git_path_ok "a/./b"      && exit 13
+    git_path_ok ".."         && exit 14
+    git_path_ok "/abs"       && exit 15
+    git_path_ok "a//b"       && exit 16
+    git_path_ok "a/"         && exit 17
+    git_path_ok "src/../x"   && exit 18
+    exit 0
+  )
+  n2rc=$?
+  if [ "$n2rc" -eq 0 ]; then
+    pass "N2: Segment-Traversal/-Pfade abgelehnt, normale Pfade erlaubt"
+  else
+    fail "N2: git_path_ok Verhalten falsch (Code $n2rc)"
+  fi
+fi
+
+# N6: Konvention - Kennung NUR im Body, Titel ohne Praefix.
+N6F="$WORK/git_author.sh"
+awk '/^git_author_ok\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$TEAMCTL" > "$N6F"
+awk '/^git_author_hint\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$TEAMCTL" >> "$N6F"
+if ! grep -q '^git_author_hint() {' "$N6F"; then
+  fail "N6: git_author_ok/git_author_hint nicht extrahierbar"
+else
+  (
+    . "$N6F"
+    git_author_ok "Normaler Kurztitel" "$(printf 'Ersteller: team-engineer\nDatum: 2026-09-29\nText')" || exit 10
+    git_author_ok "t" "kein Ersteller" && exit 11
+    git_author_ok "[x] t" "kein Ersteller" && exit 12
+    git_author_hint 2>&1 | grep -q 'OHNE Praefix' || exit 13
+    exit 0
+  )
+  n6rc=$?
+  if [ "$n6rc" -eq 0 ]; then
+    pass "N6 (a): Identitaet nur aus dem Body; Hinweis nennt 'Titel OHNE Praefix'"
+  else
+    fail "N6: git_author_ok/Hinweis entsprechen nicht der Konvention (Code $n6rc)"
+  fi
+fi
+
+# N6 end-to-end: konventionsgerechte Anlage erzeugt KEINE Warnung mehr.
+N6BIN="$WORK/n6bin"; mkdir -p "$N6BIN"
+N6_LOG="$WORK/n6.log"
+cat > "$N6BIN/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub: emuliert die Issue-API (kein Netz). Protokoll: <METHODE>\t<URL>\t<BODY>
+method=GET; out=/dev/null; data=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    --data-binary) data="$2"; shift 2 ;;
+    -H|--max-time|-w) shift 2 ;;
+    -sS|-s|-S) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\t%s\t%s\n' "$method" "$url" "$data" >> "$N6_LOG"
+body=""; code=200
+case "$method $url" in
+  "POST "*"/issues")      body='{"number":26,"html_url":"https://example.invalid/i/26"}' ;;
+  "GET "*"/issues/26")    body='{"number":26,"state":"open"}' ;;
+  *)                      code=500; body='{"message":"stub: unhandled"}' ;;
+esac
+printf '%s' "$body" > "$out"
+printf '%s' "$code"
+STUB
+chmod +x "$N6BIN/curl"
+n6run() {  # $@ = Argumente fuer git issue (repo fest: teamctl)
+  : > "$N6_LOG"
+  PATH="$N6BIN:$PATH" TEAMCTL_ENV_FILE="$ENVF" TEAMCTL_WIKI_CA='' \
+    TEAMCTL_GITHUB_TOKEN_CMD='printf selftest-token' N6_LOG="$N6_LOG" \
+    bash "$TEAMCTL" git issue teamctl "$@"
+}
+n6o="$(n6run --title 'Normaler Kurztitel' --body "$(printf 'Ersteller: team-engineer\nDatum: 2026-09-29\nText')" 2>&1)"; n6rc=$?
+if [ "$n6rc" -ne 0 ] || ! printf '%s' "$n6o" | grep -q '^OK'; then
+  fail "N6 (b): konventionsgerechte Anlage fehlgeschlagen (rc=$n6rc)"
+  printf '%s\n' "$n6o" | sed 's/^/      /' >&2
+elif printf '%s' "$n6o" | grep -q 'WARNUNG'; then
+  fail "N6 (b): WARNUNG trotz konventionsgerechtem Body"
+else
+  pass "N6 (b): konventionsgerechte Anlage ohne WARNUNG (Exit $n6rc)"
+fi
+
+# N6: Body ohne Kennung -> weiterhin Warnung (Exit 0).
+n6o2="$(n6run --title 'Kurztitel' --body 'Text ohne Kennung' 2>&1)"; n6rc2=$?
+if [ "$n6rc2" -eq 0 ] && printf '%s' "$n6o2" | grep -q 'WARNUNG'; then
+  pass "N6 (c): fehlende Body-Kennung -> WARNUNG (Exit 0)"
+else
+  fail "N6 (c): fehlende Body-Kennung nicht gewarnt (rc=$n6rc2)"
+fi
+
+# N6: --require-author bricht ohne Body-Kennung ab (kein API-Schreibaufruf).
+n6o3="$(n6run --title 'Kurztitel' --body 'Text' --require-author 2>&1)"; n6rc3=$?
+if [ "$n6rc3" -eq 0 ] || grep -q $'^POST\t' "$N6_LOG"; then
+  fail "N6 (d): --require-author ohne Kennung nicht abgelehnt (rc=$n6rc3)"
+else
+  pass "N6 (d): --require-author ohne Body-Kennung -> Abbruch ohne API-Aufruf"
+fi
+
+# N6: --author setzt die Kennung NUR im Body - kein Titel-Praefix.
+n6o4="$(n6run --title 'Kurztitel' --body 'Text' --author team-engineer 2>&1)"; n6rc4=$?
+n6payload="$(grep -m1 $'^POST\t' "$N6_LOG" | cut -f3-)"
+n6title="$(printf '%s' "$n6payload" | jq -r '.title // empty' 2>/dev/null)"
+n6body="$(printf '%s' "$n6payload" | jq -r '.body // empty' 2>/dev/null)"
+if [ "$n6rc4" -ne 0 ] || ! printf '%s' "$n6o4" | grep -q '^OK'; then
+  fail "N6 (e): --author fehlgeschlagen (rc=$n6rc4)"
+elif printf '%s' "$n6o4" | grep -q 'WARNUNG'; then
+  fail "N6 (e): --author erzeugt WARNUNG"
+else
+  case "$n6title" in
+    "["*) fail "N6 (e): --author setzt weiterhin ein Titel-Praefix ('$n6title')" ;;
+    *)
+      if printf '%s' "$n6body" | grep -q '^Ersteller: team-engineer'; then
+        pass "N6 (e): --author setzt Kennung nur im Body (Titel ohne Praefix)"
+      else
+        fail "N6 (e): --author setzt keine Body-Kennung"
+      fi ;;
+  esac
+fi
+
+# N4: Manifest-/TSV-Feld entschaerfen (Tabs/CR/LF -> Leerzeichen).
+N4F="$WORK/wex_tsv.sh"
+grep -m1 '^wex_tsv()' "$TEAMCTL" > "$N4F"
+if [ ! -s "$N4F" ]; then
+  fail "N4: wex_tsv fehlt"
+else
+  ( . "$N4F"; got="$(wex_tsv "$(printf 'a\tb\rc\nd')")"; [ "$got" = "a b c d" ] )
+  if [ $? -eq 0 ]; then
+    pass "N4: wex_tsv entschaerft TAB/CR/LF zu Leerzeichen"
+  else
+    fail "N4: wex_tsv falsch"
+  fi
+fi
+if grep -q 'teamctl-wex-XXXXXX' "$TEAMCTL"; then
+  pass "N4: Manifest-/Datei-Temp im Zielverzeichnis (atomares mv)"
+else
+  fail "N4: Temp nicht im Zielverzeichnis erzeugt"
 fi
 
 # --- Ergebnis ---------------------------------------------------------------

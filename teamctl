@@ -36,6 +36,31 @@ declare -A _ENV_SAVE=()
 for _k in "${CONFIG_KEYS[@]}"; do _ENV_SAVE["$_k"]="${!_k:-}"; done
 
 if [ -f "$CONFIG_FILE" ]; then
+  # Sicherheit (N5): die Konfigurationsdatei wird als Shell-Code eingelesen.
+  # Deshalb VOR dem Sourcen Besitzer und Schreibrechte pruefen - eine von
+  # Dritten manipulierbare oder einem fremden Konto gehoerende Datei darf
+  # nicht ausgefuehrt werden. Regel: regulaere Datei (kein Symlink),
+  # Eigentuemer = aktueller Nutzer (oder root), nicht gruppen-/welt-schreibbar.
+  _cf_err=""
+  if [ -L "$CONFIG_FILE" ]; then
+    _cf_err="Symlink"
+  else
+    _cf_owner="$(stat -c '%u' "$CONFIG_FILE" 2>/dev/null || printf '')"
+    case "$_cf_owner" in
+      "$(id -u)"|0) ;;
+      *) _cf_err="fremder Eigentuemer" ;;
+    esac
+    if [ -z "$_cf_err" ] && [ -n "$(find "$CONFIG_FILE" -maxdepth 0 -perm /022 -print 2>/dev/null)" ]; then
+      _cf_err="gruppe-/welt-schreibbar"
+    fi
+  fi
+  if [ -n "$_cf_err" ]; then
+    printf 'teamctl: FEHLER: Konfigurationsdatei unsicher (%s) - wird nicht geladen.\n' "$_cf_err" >&2
+    printf 'teamctl: Datei: %s\n' "$CONFIG_FILE" >&2
+    printf 'teamctl: Erwartet: regulaere Datei, Eigentuemer = aktueller Nutzer, Modus ohne Gruppen-/Welt-Schreibrecht (chmod 600).\n' >&2
+    exit 1
+  fi
+  unset _cf_err _cf_owner
   # shellcheck disable=SC1090
   . "$CONFIG_FILE"
 fi
@@ -807,6 +832,11 @@ wex_schema_file() {
   printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9-]*__[a-z0-9][a-z0-9-]*(-[A-Za-z0-9]{8})?\.md$'
 }
 
+# wex_tsv <text> - entschaerft ein Manifest-/TSV-Feld (N4): echte Tabs, CR und
+# LF wuerden die spaltige Struktur von .wiki-sync-manifest.tsv zerstoeren und
+# werden daher durch Leerzeichen ersetzt.
+wex_tsv() { printf '%s' "${1:-}" | tr '\t\r\n' '   '; }
+
 # wiki_export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
 # Exportiert alle (oder mit --space nur die eines Spaces) Docmost-Seiten als
 # Markdown: eine Datei je Seite "<space-slug>__<page-slug>.md" mit YAML-Kopfzeile
@@ -835,12 +865,23 @@ wiki_export() {
   local sleep_s="${TEAMCTL_WIKI_EXPORT_SLEEP:-0.2}"
   local manifest="$out/.wiki-sync-manifest.tsv"
   local tmp_manifest pages_tmp one_tmp file_tmp
-  tmp_manifest="$(mktmp)"; pages_tmp="$(mktmp)"; one_tmp="$(mktmp)"; file_tmp="$(mktmp)"
-  : > "$tmp_manifest"; : > "$pages_tmp"
+  pages_tmp="$(mktmp)"; one_tmp="$(mktmp)"
 
   if [ "$dry" -eq 0 ]; then
     mkdir -p "$out" 2>/dev/null || die "wiki export: Zielverzeichnis nicht beschreibbar: $out"
   fi
+
+  # N4: Temp-Dateien im ZIELVERZEICHNIS anlegen, damit das abschliessende mv
+  # atomar bleibt (gleiches Dateisystem). Fehlt/schuetzt das Ziel (z. B.
+  # --dry-run ohne vorhandenes --out), wird auf ein normales mktemp ausgewichen.
+  if [ -d "$out" ] && [ -w "$out" ]; then
+    tmp_manifest="$(mktemp "$out/.teamctl-wex-XXXXXX" 2>/dev/null)"
+    file_tmp="$(mktemp "$out/.teamctl-wex-XXXXXX" 2>/dev/null)"
+  fi
+  [ -n "${tmp_manifest:-}" ] || tmp_manifest="$(mktmp)"
+  [ -n "${file_tmp:-}" ] || file_tmp="$(mktmp)"
+  TMPFILES+=("$pages_tmp" "$one_tmp" "$tmp_manifest" "$file_tmp")
+  : > "$tmp_manifest"; : > "$pages_tmp"
 
   wiki_login "$WIKI_AS"
   wiki_api "spaces/" '{}' || die "wiki export: Spaces nicht lesbar (HTTP $WIKI_HTTP)"
@@ -905,15 +946,15 @@ wiki_export() {
 
     if [ -f "$out/$fname" ] && cmp -s "$file_tmp" "$out/$fname"; then
       n_unchanged=$((n_unchanged + 1))
-      printf '%s\t%s\t%s\t%s\n' "$fname" "$pid" "$sslug2" "$ptitle" >> "$tmp_manifest"
+      printf '%s\t%s\t%s\t%s\n' "$fname" "$pid" "$sslug2" "$(wex_tsv "$ptitle")" >> "$tmp_manifest"
     elif [ "$dry" -eq 1 ]; then
       wex_log "$quiet" "  ~ $fname (dry-run)"
       n_written=$((n_written + 1))
-      printf '%s\t%s\t%s\t%s\n' "$fname" "$pid" "$sslug2" "$ptitle" >> "$tmp_manifest"
+      printf '%s\t%s\t%s\t%s\n' "$fname" "$pid" "$sslug2" "$(wex_tsv "$ptitle")" >> "$tmp_manifest"
     elif mv "$file_tmp" "$out/$fname" 2>/dev/null; then
       wex_log "$quiet" "  ~ $fname"
       n_written=$((n_written + 1))
-      printf '%s\t%s\t%s\t%s\n' "$fname" "$pid" "$sslug2" "$ptitle" >> "$tmp_manifest"
+      printf '%s\t%s\t%s\t%s\n' "$fname" "$pid" "$sslug2" "$(wex_tsv "$ptitle")" >> "$tmp_manifest"
     else
       note "wiki export: Datei nicht schreibbar: $fname"
       n_failed=$((n_failed + 1))
@@ -1003,8 +1044,28 @@ blog_list() {
   ssh_run "ls -1 -- '$BLOG_DIR/posts' 2>/dev/null | sed 's/[.]html$//'" || die "blog: Posts nicht lesbar ($BLOG_DIR/posts)"
 }
 
+# remote_mktmp <prefix> - erzeugt auf dem Zielhost eine eindeutige Tempdatei
+# via mktemp und gibt deren Pfad aus (leer bei Fehler). N1: vorhersagbare
+# Namen wie /tmp/teamctl_blog_$$.html sind eine Symlink-/Race-Falle.
+remote_mktmp() {
+  local p="${1:-teamctl}" out
+  out="$(ssh_run "mktemp -p /tmp '${p}.XXXXXX'" 2>/dev/null)" || return 1
+  out="$(printf '%s\n' "$out" | sed -n '1p')"
+  case "$out" in
+    /tmp/*|/var/tmp/*) printf '%s' "$out" ;;
+    *) printf '' ;;
+  esac
+}
+
+# remote_rm <pfad> - entfernt eine remote Tempdatei best-effort (nur /tmp-Pfade).
+remote_rm() {
+  local p="${1:-}"
+  case "$p" in /tmp/*|/var/tmp/*) ssh_run "rm -f '$p'" >/dev/null 2>&1 || true ;; esac
+  return 0
+}
+
 blog_publish() {
-  local file="" slug="" tmp out remote_size local_size
+  local file="" slug="" tmp out remote_size remote_hash local_size local_hash
   while [ $# -gt 0 ]; do case "$1" in
     --file) [ $# -ge 2 ] || die "blog publish: --file braucht einen Wert"; file="$2"; shift 2 ;;
     --slug) [ $# -ge 2 ] || die "blog publish: --slug braucht einen Wert"; slug="$2"; shift 2 ;;
@@ -1014,11 +1075,18 @@ blog_publish() {
   [ -n "$slug" ] || die "blog publish: --slug fehlt"
   [ -f "$file" ] || die "Datei nicht gefunden: $file"
   [[ "$slug" =~ $BLOG_SLUG_RE ]] || die "blog publish: ungueltiger Slug '$slug'"
-  tmp="/tmp/teamctl_blog_$$.html"
-  scp_to "$file" "$tmp" || die "blog publish: scp fehlgeschlagen"
-  out="$(ssh_run "install -m 644 '$tmp' '$BLOG_DIR/posts/$slug.html' && rm -f '$tmp' && wc -c < '$BLOG_DIR/posts/$slug.html'")" || die "blog publish: Deployment fehlgeschlagen"
-  remote_size="$(printf '%s' "$out" | tr -d '[:space:]')"
+  tmp="$(remote_mktmp teamctl_blog)"
+  [ -n "$tmp" ] || die "blog publish: keine remote Tempdatei (mktemp) erhalten"
+  scp_to "$file" "$tmp" || { remote_rm "$tmp"; die "blog publish: scp fehlgeschlagen"; }
+  # N3: nicht nur die Byte-Anzahl vergleichen (eine gleich grosse, falsche Datei
+  # galt sonst als OK), sondern den sha256-Hash der ausgelieferten Datei.
+  out="$(ssh_run "install -m 644 '$tmp' '$BLOG_DIR/posts/$slug.html' && rm -f '$tmp' && wc -c < '$BLOG_DIR/posts/$slug.html' && sha256sum '$BLOG_DIR/posts/$slug.html' | cut -d' ' -f1")" || die "blog publish: Deployment fehlgeschlagen"
+  remote_size="$(printf '%s\n' "$out" | sed -n '1p' | tr -d '[:space:]')"
+  remote_hash="$(printf '%s\n' "$out" | sed -n '2p' | tr -d '[:space:]')"
   local_size="$(wc -c < "$file" | tr -d '[:space:]')"
+  local_hash="$(sha256sum "$file" | cut -d' ' -f1)"
+  [ -n "$remote_hash" ] || die "blog publish: Verifikation fehlgeschlagen (kein sha256 von remote)"
+  [ "$remote_hash" = "$local_hash" ] || die "blog publish: Verifikation fehlgeschlagen (sha256 remote=$remote_hash lokal=$local_hash)"
   [ "$remote_size" = "$local_size" ] || die "blog publish: Verifikation fehlgeschlagen (remote=$remote_size lokal=$local_size)"
   printf 'OK\t/posts/%s.html\t%s\n' "$slug" "$remote_size"
 }
@@ -1051,8 +1119,9 @@ if i == -1:
     sys.stderr.write('kein </ul> in index.html gefunden\n'); sys.exit(1)
 io.open(path, 'w', encoding='utf-8').write(doc[:i] + item + doc[i:])
 PY
-  remote_tmp="/tmp/teamctl_index_$$.html"
-  scp_to "$tmp" "$remote_tmp" || die "blog link: scp fehlgeschlagen"
+  remote_tmp="$(remote_mktmp teamctl_index)"
+  [ -n "$remote_tmp" ] || die "blog link: keine remote Tempdatei (mktemp) erhalten"
+  scp_to "$tmp" "$remote_tmp" || { remote_rm "$remote_tmp"; die "blog link: scp fehlgeschlagen"; }
   ssh_run "install -m 644 '$remote_tmp' '$BLOG_DIR/index.html' && rm -f '$remote_tmp'" || die "blog link: Deployment fehlgeschlagen"
   after="$(ssh_run "grep -c 'href=\"/posts/' '$BLOG_DIR/index.html'" || true)"
   [ "$after" -eq "$((before + 1))" ] || die "blog link: Verifikation fehlgeschlagen (vorher=$before nachher=$after)"
@@ -1088,10 +1157,20 @@ git_repo_ok() {
 # Pfade (fuehrendes "/") ablehnen, damit keine API-Pfade wie
 # /repos/$GITHUB_OWNER/$repo/contents/../... entstehen.
 git_path_ok() {
-  local p="$1"
+  local p="$1" seg
+  local -a segs
   [ -n "$p" ] || return 1
-  case "$p" in .|..) return 1 ;; esac
-  case "$p" in /*) return 1 ;; esac
+  case "$p" in /*|*/) return 1 ;; esac
+  # N2: nicht nur "."/".." als Ganzes ablehnen, sondern JEDES Pfadsegment
+  # (auch "a/../b", "a/./b", leere Segmente durch "//"); End-Slash ist oben
+  # bereits abgewiesen.
+  local IFS=/
+  read -ra segs <<< "$p" || return 1
+  for seg in "${segs[@]}"; do
+    case "$seg" in
+      ""|.|..) return 1 ;;
+    esac
+  done
   return 0
 }
 
@@ -1490,13 +1569,15 @@ git_status() {
 }
 
 # git_author_ok <title> <body>
-# Prueft die Ersteller-Kennung der Konvention: Titel beginnt mit "[<agent-id>]",
-# Body beginnt mit "Ersteller:" (gefolgt von "Datum: <YYYY-MM-DD>").
+# Prueft die Ersteller-Kennung der Konvention: der Body beginnt mit
+# "Ersteller:" (gefolgt von "Datum: <YYYY-MM-DD>"). Der Titel ist ein normaler
+# Kurztitel OHNE Praefix - die Agent-Kennung steht NUR im Body (N6: frueher
+# wurde zusaetzlich das Titel-Praefix "[<agent-id>]" verlangt, wodurch jede
+# konventionsgerechte Anlage eine WARNUNG erzeugte).
 # Quelle der Konvention: Wiki "Team & Koordination" -> "Richtlinien & Vorgaben".
-# Rueckgabe: 0 = beide Kennungen vorhanden, 1 = mindestens eine fehlt.
+# Rueckgabe: 0 = Kennung im Body vorhanden, 1 = fehlt.
 git_author_ok() {
-  local title="$1" body="$2"
-  case "$title" in "["*) ;; *) return 1 ;; esac
+  local body="$2"
   case "$body" in "Ersteller:"*) ;; *) return 1 ;; esac
   return 0
 }
@@ -1504,7 +1585,7 @@ git_author_ok() {
 # git_author_hint - Konventionshinweis auf stderr.
 # Nennt nur Platzhalter/Schluesselnamen (keine Secrets, keine Infra-Werte).
 git_author_hint() {
-  printf 'teamctl: Konvention: Titel-Praefix "[<agent-id>]", Body-Beginn "Ersteller: <agent-id>" und "Datum: <YYYY-MM-DD>".\n' >&2
+  printf 'teamctl: Konvention: Titel als normaler Kurztitel OHNE Praefix; Body-Beginn "Ersteller: <agent-id>" und "Datum: <YYYY-MM-DD>".\n' >&2
   printf 'teamctl: Quelle: Wiki "Team & Koordination" -> "Richtlinien & Vorgaben".\n' >&2
 }
 
@@ -1531,14 +1612,11 @@ git_issue() {
   fi
   [ -n "$body" ] || die "git issue: --body oder --file fehlt (Text des Wunsches)"
   # Optionales Hilfsflag --author: Kennung automatisch setzen.
-  # Titel-Praefix "[<agent-id>] " nur, wenn der Titel noch nicht mit "[" beginnt.
-  # Body-Beginn "Ersteller: <agent-id>" + "Datum: <YYYY-MM-DD>" nur, wenn der
-  # Body nicht schon mit "Ersteller:" beginnt (idempotent).
+  # Konvention (N6): die Agent-Kennung steht NUR im Body - der Titel bleibt ein
+  # normaler Kurztitel OHNE Praefix. Body-Beginn "Ersteller: <agent-id>" +
+  # "Datum: <YYYY-MM-DD>" nur, wenn der Body nicht schon mit "Ersteller:"
+  # beginnt (idempotent).
   if [ -n "$author" ]; then
-    case "$title" in
-      "["*) ;;
-      *) title="[$author] $title" ;;
-    esac
     case "$body" in
       "Ersteller:"*) ;;
       *) body="Ersteller: $author

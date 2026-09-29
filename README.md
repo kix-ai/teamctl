@@ -48,6 +48,12 @@ Umgebungsvariablen, die Vorrang haben). Der Pfad ist per `TEAMCTL_ENV_FILE`
 aenderbar. Fehlt ein Pflichtwert, bricht `teamctl` mit einer klaren Fehlermeldung
 und Verweis auf die Konfigurationsdatei ab.
 
+Die Konfigurationsdatei wird als Shell-Code eingelesen und daher vor dem Laden
+geprueft (N5): sie muss eine regulaere Datei sein (kein Symlink), dem aktuellen
+Nutzer (oder root) gehoeren und darf kein Gruppen-/Welt-Schreibrecht tragen
+(`chmod 600`). Andernfalls bricht `teamctl` mit einer Meldung ab und fuehrt die
+Datei **nicht** aus; die Meldung nennt nur den Pfad, nie Werte.
+
 ### Pflichtwerte
 
 | Variable | Bedeutung |
@@ -145,18 +151,20 @@ die jeweiligen Unterbefehle.
 ### Ersteller-Kennung bei `git issue`
 
 Konvention (Quelle: Wiki "Team & Koordination" -> "Richtlinien & Vorgaben"):
-ein Issue traegt im Titel das Praefix `[<agent-id>]` und beginnt im Body mit
-`Ersteller: <agent-id>` sowie `Datum: <YYYY-MM-DD>`.
+der Titel ist ein **normaler Kurztitel ohne Praefix**; die Agent-Kennung steht
+**nur im Body** - dort beginnt der Text mit `Ersteller: <agent-id>` sowie
+`Datum: <YYYY-MM-DD>`. (N6: frueher verlangte die Pruefung zusaetzlich das
+Titel-Praefix `[<agent-id>]`, wodurch jede konventionsgerechte Anlage eine
+WARNUNG erzeugte.)
 
-- `teamctl git issue` prueft die Kennung und warnt bei fehlender/unvollstaendiger
-  Kennung auf **stderr** - das Issue wird trotzdem angelegt, der Exit-Code bleibt 0.
+- `teamctl git issue` prueft die Body-Kennung und warnt bei fehlender Kennung
+  auf **stderr** - das Issue wird trotzdem angelegt, der Exit-Code bleibt 0.
 - `--require-author` macht die Pruefung strikt: fehlt die Kennung, bricht
   `teamctl` mit Klartext auf stderr und Exit-Code ungleich 0 ab - **bevor** ein
   Issue angelegt wird (kein API-Schreibaufruf).
-- `--author <agent-id>` setzt die Kennung automatisch: Titel-Praefix
-  `[<agent-id>] ` (falls der Titel noch nicht mit `[` beginnt) und Body-Beginn
+- `--author <agent-id>` setzt die Kennung automatisch: Body-Beginn
   `Ersteller: <agent-id>` + `Datum: <YYYY-MM-DD>` (falls der Body nicht schon
-  mit `Ersteller:` beginnt).
+  mit `Ersteller:` beginnt). Der Titel bleibt unveraendert (kein Praefix).
 
 Ohne die neuen Flags bleiben Titel und Body unveraendert; die Pruefung aendert die
 stdout-Ausgabe nicht (Hinweise gehen ausschliesslich auf stderr).
@@ -195,6 +203,9 @@ indiziert; so ist das Wiki durchsuchbar, ohne jede Seite in den Kontext zu laden
   `<space>__<page>[-<pid8>].md` angefasst - fremde `*.md` im `--out` bleiben
   erhalten; aggressives Loeschen ALLER nicht im Manifest stehenden `*.md`
   erfordert explizites `--prune`, `--no-prune` deaktiviert das Pruning ganz.
+- Atomar/idempotent: Manifest und Export-Dateien werden im Zielverzeichnis
+  zwischengeschrieben und per `mv` (gleiches Dateisystem) umbenannt; erst
+  schreiben, wenn sich der Inhalt geaendert hat (N4).
 - Exit 0 = vollstaendiger Export, 1 = Fehler (unvollstaendig).
 
     teamctl wiki export [--out DIR] [--space <spaceId>] [--dry-run] [--prune|--no-prune] [--quiet]
@@ -371,12 +382,29 @@ teamctl doctor
   `<space>__<page>[-<pid8>].md` entsprechen; fremde `*.md` im `--out` bleiben
   erhalten. Aggressives Loeschen ALLER nicht im Manifest stehenden `*.md` nur
   mit explizitem `--prune` (M1).
+- Die Konfigurationsdatei wird nur geladen, wenn sie sicher ist: regulaere Datei
+  (kein Symlink), Eigentuemer = aktueller Nutzer/root, kein Gruppen-/Welt-
+  Schreibrecht (N5). Sonst Abbruch ohne Ausfuehrung.
+- `git`-Pfade werden segmentweise geprueft (N2): abgelehnt werden absolute
+  Pfade, End-Slash, leere Segmente (`a//b`) und jedes `.`/`..`-Segment
+  (auch `a/../b`), damit keine Traversal-API-Pfade entstehen.
+- `blog publish`/`blog link` erzeugen ihre remote Tempdateien mit `mktemp`
+  (N1: keine vorhersagbaren `/tmp/teamctl_*_$$`-Namen) und verifizieren
+  `blog publish` ueber den `sha256`-Hash der ausgelieferten Datei (N3), nicht
+  nur ueber die Byte-Anzahl. `blog link` verifiziert die Link-Anzahl in
+  `index.html`.
+- `wiki export` legt Manifest- und Datei-Temp im Zielverzeichnis an, damit das
+  abschliessende `mv` innerhalb desselben Dateisystems atomar bleibt (N4);
+  Manifest-Felder werden von echten Tabs/CR/LF befreit (`wex_tsv`), damit die
+  spaltige `.wiki-sync-manifest.tsv` nicht zerstoert wird.
 
 ## Selbsttest (Regressions-Guard)
 
 `tests/selftest.sh` prueft Syntax, das dateiweite Fehlen jeglicher
-Shell-Auswertung (`eval`) im Kommandokontext und die Ablehnung von
-Metazeichen in `TEAMCTL_GITHUB_TOKEN_CMD`:
+Shell-Auswertung (`eval`) im Kommandokontext, die Ablehnung von Metazeichen in
+`TEAMCTL_GITHUB_TOKEN_CMD` sowie die Haertungen N1-N6 (Config-Rechte/-Owner,
+Segment-Traversal, remote `mktemp` + `sha256`-Verifikation beim Blog-Publish,
+Body-only-Erstellerkennung, atomarer Wiki-Export):
 
 ```bash
 bash tests/selftest.sh
